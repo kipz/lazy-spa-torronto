@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""
+Torronto Web — control & visualisation server for the Lay-Z-Spa.
+
+Zero-dependency (stdlib only) HTTP server that exposes:
+  * live spa state + temperature history (JSONL append)
+  * full control API (power/heat/filter/wave/jet/lock/temp)
+  * auto-heating mode (drives scheduler.py's optimal-start policy)
+  * weather + heating-plan preview for the SPA
+
+Serves the single-page app from ./static and a JSON API under /api.
+
+Config is read from web.env (gitignored); see web.env.example.
+Defaults: BIND=0.0.0.0, PORT=8080, MODE=manual (auto-heat is opt-in).
+
+Security note: this server controls a real device with no authentication.
+It is intended for a trusted LAN only. Do not expose it to the internet.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+POLL_SECONDS = 15.0
+HISTORY_SECONDS = 7 * 86400        # keep ~1 week of history in memory
+SAMPLE_SECONDS = 60                # throttle JSONL appends to 1/min
+
+import scheduler  # noqa: E402
+import spa  # noqa: E402
+
+
+class WebConfig:
+    """Thin wrapper over web.env with mode + window state."""
+    DEFAULTS = {
+        "BIND": "0.0.0.0",
+        "PORT": 8080,
+        "MODE": "manual",           # auto | manual (scheduler enabled?)
+        "HISTORY_H": 48,
+    }
+
+    def __init__(self):
+        env = scheduler.load_env(os.path.join(BASE_DIR, "web.env"))
+        self.bind = env.get("BIND", self.DEFAULTS["BIND"])
+        self.mode = env.get("MODE", self.DEFAULTS["MODE"])
+        try:
+            self.port = int(env.get("PORT", self.DEFAULTS["PORT"]))
+        except (TypeError, ValueError):
+            self.port = self.DEFAULTS["PORT"]
+        try:
+            self.history_h = int(env.get("HISTORY_H", self.DEFAULTS["HISTORY_H"]))
+        except (TypeError, ValueError):
+            self.history_h = self.DEFAULTS["HISTORY_H"]
+        self.mode = "auto" if str(self.mode).lower() == "auto" else "manual"
+        # scheduler config (shared with scheduler.env values where present)
+        self.scheduler_cfg = scheduler.load_config()
+
+
+class SpaServer:
+    """Stateful bridge between HTTP handlers and the spa/scheduler."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._state = {}            # latest raw shadow
+        self._state_ts = 0.0
+        self._history = []          # [{ts, water, target, heater, ambient?}]
+        self._lock = threading.Lock()
+        self._sse_clients = set()
+        self._last_sample = 0.0
+        self._plan = None           # latest scheduler_step() result
+        self._plan_ts = 0.0
+        self._tokens = None
+        self._stopping = False
+        # resolve location once (from scheduler.env: LOCATION or LAT/LON)
+        try:
+            lat, lon, where = scheduler.resolve_location(cfg.scheduler_cfg)
+        except SystemExit:
+            lat, lon, where = 51.5074, -0.1278, "London, GB (default)"
+        self._lat, self._lon, self._where = lat, lon, where
+
+    # -- state -----------------------------------------------------------
+    def update_state(self, state):
+        with self._lock:
+            self._state = state or {}
+            self._state_ts = time.time()
+            now = int(time.time())
+            self._history.append({
+                "ts": now,
+                "water": state.get("water_temperature"),
+                "target": state.get("temperature_setting"),
+                "heater": state.get("heater_state"),
+                "power": state.get("power_state"),
+                "ambient": None,
+            })
+            # ambient is backfilled from the cached forecast
+            if self._plan and self._plan.get("plan_ts"):
+                amb_map = dict(zip(self._plan["plan_ts"], self._plan["plan_amb"]))
+                for h in self._history[-5:]:
+                    if h["ambient"] is None:
+                        h["ambient"] = amb_map.get(h["ts"])
+            self._history = [h for h in self._history
+                             if h["ts"] > now - HISTORY_SECONDS]
+        self._broadcast("state")
+
+    def get_state(self):
+        with self._lock:
+            return dict(self._state), self._state_ts
+
+    def get_history(self, hours):
+        cutoff = int(time.time()) - int(hours * 3600)
+        with self._lock:
+            return [dict(h) for h in self._history if h["ts"] >= cutoff]
+
+    # -- SSE --------------------------------------------------------------
+    def _broadcast(self, kind):
+        msg = json.dumps({"kind": kind, "ts": int(time.time())}) + "\n\n"
+        dead = []
+        for q in self._sse_clients:
+            try:
+                q.put(msg)
+            except Exception:
+                dead.append(q)
+        for q in dead:
+            self._sse_clients.discard(q)
+
+    def add_sse_client(self, q):
+        self._sse_clients.add(q)
+
+    def remove_sse_client(self, q):
+        self._sse_clients.discard(q)
+
+    # -- plan --------------------------------------------------------------
+    def refresh_plan(self, apply=False):
+        """Run one scheduler step (weather + plan; apply only if auto mode)."""
+        res = scheduler.scheduler_step(
+            self.cfg.scheduler_cfg, self._lat, self._lon, state=self.get_state()[0],
+            tokens=self._get_tokens(), apply=apply)
+        self._plan = res
+        self._plan_ts = time.time()
+        self._broadcast("plan")
+        return res
+
+    def get_plan(self):
+        return self._plan
+
+    # -- commands -----------------------------------------------------------
+    def send_command(self, datapoint, value):
+        """Clamp/validate and send a command. Raises ValueError on bad input."""
+        if datapoint == "temperature_setting":
+            value = int(value)
+            if not (20 <= value <= 40):
+                raise ValueError("temperature_setting must be 20-40")
+            if self.cfg.mode == "auto":
+                raise ValueError("temp is controlled by auto mode; switch to manual first")
+        aliases = {"power": "power_state", "heat": "heater_state",
+                   "filter": "filter_state", "wave": "wave_state",
+                   "jet": "hydrojet_state", "lock": "locked"}
+        datapoint = aliases.get(datapoint, datapoint)
+        if datapoint not in ("power_state", "heater_state", "filter_state",
+                             "wave_state", "hydrojet_state", "locked",
+                             "temperature_setting"):
+            raise ValueError("unknown datapoint %r" % datapoint)
+        if isinstance(value, str):
+            try:
+                value = int(value)
+            except ValueError:
+                raise ValueError("value must be an integer")
+        if datapoint != "temperature_setting" and value not in (0, 1):
+            raise ValueError("value must be 0 or 1")
+        resp = spa.send_command(self._get_tokens(), datapoint, value)
+        # confirm in shadow
+        ok = spa.wait_for(self._get_tokens(), datapoint, value, timeout=20)
+        return {"datapoint": datapoint, "value": value, "confirmed": ok,
+                "response": resp}
+
+    # -- tokens --------------------------------------------------------------
+    def _get_tokens(self):
+        if self._tokens is None:
+            self._tokens = spa.get_tokens()
+        return self._tokens
+
+
+class _Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass  # keep the console quiet; server logs at /api/health time
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/api/state", "/api/health", "/api/history", "/api/plan",
+                    "/api/scheduler", "/api/weather"):
+            self._api(path)
+        elif path == "/api/events":
+            self._sse()
+        elif path in ("/", "/index.html"):
+            self._static("index.html", "text/html")
+        elif path.startswith("/static/"):
+            self._static(path[len("/static/"):])
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw.decode("utf-8") or "{}")
+        except ValueError:
+            return self._send_json(400, {"error": "invalid JSON"})
+        if path == "/api/cmd":
+            self._api_cmd(body)
+        elif path == "/api/scheduler":
+            self._api_scheduler(body)
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    # -- API handlers -------------------------------------------------------
+    def _api(self, path):
+        app = self.server.app
+        if path == "/api/state":
+            state, ts = app.get_state()
+            out = {
+                "ts": int(ts),
+                "mode": app.cfg.mode,
+                "state": state,
+                "plan_ts": int(app._plan_ts) if app._plan else None,
+            }
+            if app._plan:
+                out["phase"] = app._plan["phase"]
+                out["setting"] = app._plan["setting"]
+            self._send_json(200, out)
+        elif path == "/api/health":
+            state, ts = app.get_state()
+            self._send_json(200, {
+                "online": bool(state),
+                "last_update": int(ts),
+                "age_s": int(time.time() - ts) if ts else None,
+                "mode": app.cfg.mode,
+            })
+        elif path == "/api/history":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            hours = float(qs.get("range", ["24"])[0])
+            self._send_json(200, {"series": app.get_history(min(hours, 168))})
+        elif path == "/api/plan":
+            if app._plan is None:
+                try:
+                    app.refresh_plan(apply=False)
+                except Exception as e:
+                    return self._send_json(502, {"error": str(e)})
+            self._send_json(200, app._plan)
+        elif path == "/api/scheduler":
+            self._send_json(200, {
+                "mode": app.cfg.mode,
+                "windows": app.cfg.scheduler_cfg["WINDOW"],
+                "target": app.cfg.scheduler_cfg["TARGET_TEMP"],
+                "eco": app.cfg.scheduler_cfg["ECO_TEMP"],
+                "floor": app.cfg.scheduler_cfg["FLOOR_TEMP"],
+                "margin": app.cfg.scheduler_cfg["MARGIN"],
+                "phase": app._plan["phase"] if app._plan else None,
+                "setting": app._plan["setting"] if app._plan else None,
+            })
+        elif path == "/api/weather":
+            try:
+                weather = scheduler.fetch_forecast(app._lat, app._lon, forecast_days=2)
+                now = int(time.time())
+                hour = now - (now % 3600)
+                series = []
+                for _ in range(24):
+                    entry = weather.get(hour)
+                    if entry is None:
+                        break
+                    series.append({"ts": hour, "temp": entry[0]})
+                    hour += 3600
+                self._send_json(200, {"series": series})
+            except Exception as e:
+                self._send_json(502, {"error": str(e)})
+
+    def _api_cmd(self, body):
+        app = self.server.app
+        dp = body.get("datapoint")
+        val = body.get("value")
+        if dp is None or val is None:
+            return self._send_json(400, {"error": "datapoint and value required"})
+        try:
+            res = app.send_command(dp, val)
+        except ValueError as e:
+            return self._send_json(400, {"error": str(e)})
+        except Exception as e:
+            return self._send_json(502, {"error": str(e)})
+        self._send_json(200, res)
+
+    def _api_scheduler(self, body):
+        app = self.server.app  # type: ignore[attr-defined]
+        mode = body.get("mode")
+        if mode in ("auto", "manual"):
+            app.cfg.mode = mode
+            # persist
+            path = os.path.join(BASE_DIR, "web.env")
+            existing = scheduler.load_env(path)
+            existing["MODE"] = mode
+            with open(path, "w") as f:
+                for k, v in sorted(existing.items()):
+                    f.write("%s=%s\n" % (k, v))
+            app._broadcast("mode")
+            if mode == "auto":
+                try:
+                    app.refresh_plan(apply=True)
+                except Exception as e:
+                    return self._send_json(502, {"error": "auto-start failed: %s" % e})
+        if body.get("replan"):
+            try:
+                app.refresh_plan(apply=(app.cfg.mode == "auto"))
+            except Exception as e:
+                return self._send_json(502, {"error": str(e)})
+        self._send_json(200, {"mode": app.cfg.mode})
+
+    # -- static + SSE ---------------------------------------------------------
+    def _static(self, name, ctype=None):
+        path = os.path.join(STATIC_DIR, name)
+        if not os.path.isfile(path) or ".." in name:
+            return self._send_json(404, {"error": "not found"})
+        ctype = ctype or {
+            ".html": "text/html; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+            ".js": "application/javascript; charset=utf-8",
+            ".svg": "image/svg+xml",
+        }.get(os.path.splitext(path)[1], "application/octet-stream")
+        with open(path, "rb") as f:
+            body = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _sse(self):
+        import queue
+        q = queue.Queue()
+        self.server.app.add_sse_client(q)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            while True:
+                try:
+                    data = q.get(timeout=20)
+                except queue.Empty:
+                    data = ": keepalive\n\n"
+                self.wfile.write(data.encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            self.server.app.remove_sse_client(q)
+
+    def _send_json(self, code, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _poller_loop(app, stop_event):
+    """Periodically fetch the shadow and append history.
+
+    The shadow is polled every POLL_SECONDS; the heating plan (which costs a
+    weather API call) is refreshed at most once per hour, unless a replan is
+    explicitly requested.
+    """
+    next_plan = 0.0  # always refresh on first iteration
+    while not stop_event.is_set():
+        now = time.time()
+        try:
+            state = spa.shadow(app._get_tokens())
+            app.update_state(state)
+        except Exception as e:
+            print("[%s] poller error: %s" % (time.strftime("%F %T"), e), flush=True)
+        # plan refresh aligned to hour boundaries (weather API budget + so the
+        # preheat/window transitions are picked up on time)
+        if now >= next_plan:
+            try:
+                app.refresh_plan(apply=(app.cfg.mode == "auto"))
+            except Exception:
+                pass
+            next_plan = now - (now % 3600) + 3600  # top of next hour
+        stop_event.wait(POLL_SECONDS)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Torronto Web server")
+    ap.add_argument("--bind", help="bind address (default: web.env BIND)")
+    ap.add_argument("--port", type=int, help="port (default: web.env PORT)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="start with mock state, never touch the spa")
+    args = ap.parse_args()
+
+    cfg = WebConfig()
+    bind = args.bind or cfg.bind
+    port = args.port or cfg.port
+    # ensure static dir exists
+    if not os.path.isdir(STATIC_DIR):
+        os.makedirs(STATIC_DIR, exist_ok=True)
+
+    app = SpaServer(cfg)
+    httpd = ThreadingHTTPServer((bind, port), _Handler)
+    httpd.app = app  # type: ignore[attr-defined]
+    print("Torronto Web listening on http://%s:%d  (mode=%s)"
+          % (bind, port, cfg.mode), flush=True)
+    print("  API: /api/state /api/history /api/plan /api/scheduler /api/cmd", flush=True)
+    print("  SPA: http://%s:%d/" % (bind, port), flush=True)
+
+    stop = threading.Event()
+    t = threading.Thread(target=_poller_loop, args=(app, stop), daemon=True)
+    t.start()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        httpd.server_close()
+        print("bye", flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Torronto · Lay-Z-Spa</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌊</text></svg>">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- ======= Header ======= -->
+  <header class="topbar glass">
+    <div class="brand">
+      <span class="brand-wave">🌊</span>
+      <div>
+        <h1>Torronto</h1>
+        <span class="subtitle">Lay-Z-Spa · cloud control</span>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span id="conn" class="pill offline">…</span>
+      <label class="mode-switch" title="Auto = scheduler controls heating">
+        <input type="checkbox" id="modeToggle">
+        <span class="mode-track"><span class="mode-thumb"></span></span>
+        <span class="mode-label" id="modeLabel">MANUAL</span>
+      </label>
+      <button id="replanBtn" class="btn ghost" title="Recompute heating plan">↻ replan</button>
+    </div>
+  </header>
+
+  <!-- ======= Hero: gauge + quick facts ======= -->
+  <section class="hero glass">
+    <div class="gauge-wrap">
+      <svg id="gauge" viewBox="0 0 220 140" role="img" aria-label="water temperature gauge">
+        <path id="gaugeTrack" class="g-track" d="M20 120 A90 90 0 0 1 200 120"></path>
+        <path id="gaugeArc" class="g-arc" d="M20 120 A90 90 0 0 1 200 120"></path>
+        <g class="g-ticks" id="gaugeTicks"></g>
+        <text id="gaugeTemp" class="g-temp" x="110" y="92" text-anchor="middle"></text>
+        <text id="gaugeUnit" class="g-unit" x="110" y="112" text-anchor="middle">°C</text>
+        <text id="gaugeLabel" class="g-label" x="110" y="134" text-anchor="middle">water temp</text>
+      </svg>
+      <div id="heaterBadge" class="badge heater-off">🔥 heater</div>
+      <div id="targetBadge" class="badge target">🎯 40°C</div>
+    </div>
+    <div class="hero-facts">
+      <div class="fact">
+        <span class="fact-k">target</span>
+        <span class="fact-v" id="factTarget">—</span>
+      </div>
+      <div class="fact">
+        <span class="fact-k">phase</span>
+        <span class="fact-v" id="factPhase">—</span>
+      </div>
+      <div class="fact">
+        <span class="fact-k">ambient</span>
+        <span class="fact-v" id="factAmb">—</span>
+      </div>
+      <div class="fact">
+        <span class="fact-k">error</span>
+        <span class="fact-v" id="factError">none</span>
+      </div>
+      <div class="fact">
+        <span class="fact-k">forecast 24h</span>
+        <span class="fact-v" id="factWeather">—</span>
+      </div>
+      <div class="fact">
+        <span class="fact-k">energy (plan)</span>
+        <span class="fact-v" id="factEnergy">—</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======= Chart ======= -->
+  <section class="chart-card glass">
+    <div class="chart-head">
+      <h2>📈 History</h2>
+      <div class="range-pills" id="rangePills">
+        <button class="pill-btn active" data-range="6">6h</button>
+        <button class="pill-btn" data-range="24">24h</button>
+        <button class="pill-btn" data-range="72">3d</button>
+        <button class="pill-btn" data-range="168">7d</button>
+      </div>
+    </div>
+    <canvas id="chart"></canvas>
+    <div class="legend">
+      <span class="lg"><i class="sw water"></i>water</span>
+      <span class="lg"><i class="sw ambient"></i>ambient</span>
+      <span class="lg"><i class="sw target"></i>target</span>
+    </div>
+  </section>
+
+  <!-- ======= Controls ======= -->
+  <section class="grid">
+    <div class="panel glass">
+      <h2>🎛️ Controls</h2>
+      <div class="toggles">
+        <label class="tile"><input type="checkbox" data-dp="power_state" checked><span class="tile-box">⚡<b>Power</b></span></label>
+        <label class="tile"><input type="checkbox" data-dp="heater_state"><span class="tile-box">🔥<b>Heat</b></span></label>
+        <label class="tile"><input type="checkbox" data-dp="filter_state"><span class="tile-box">🌀<b>Filter</b></span></label>
+        <label class="tile"><input type="checkbox" data-dp="wave_state"><span class="tile-box">🫧<b>Bubbles</b></span></label>
+        <label class="tile"><input type="checkbox" data-dp="hydrojet_state"><span class="tile-box">💦<b>Jet</b></span></label>
+        <label class="tile"><input type="checkbox" data-dp="locked"><span class="tile-box">🔒<b>Lock</b></span></label>
+      </div>
+      <div class="temp-ctl">
+        <span>Set target temp</span>
+        <div class="temp-slider">
+          <output id="tempOut">40</output>°C
+          <input type="range" id="tempRange" min="20" max="40" step="1" value="40">
+        </div>
+      </div>
+    </div>
+
+    <div class="panel glass">
+      <h2>⏱️ Auto-heating</h2>
+      <div class="auto-info">
+        <p class="hint" id="autoHint">Auto mode runs the optimal-start scheduler: hot by the window, minimum kWh.</p>
+        <div class="auto-row"><span>window</span><code id="cfgWindow">—</code></div>
+        <div class="auto-row"><span>target / eco / floor</span><code id="cfgTemps">—</code></div>
+        <div class="auto-row"><span>margin</span><code id="cfgMargin">—</code></div>
+      </div>
+      <div id="planStrip" class="plan-strip" title="Heater ON blocks (next 24h)"></div>
+      <div class="plan-legend">
+        <span><i class="sw on"></i>heater ON</span>
+        <span><i class="sw off"></i>eco/off</span>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<!-- toast host -->
+<div id="toasts" class="toasts"></div>
+<div id="confirm" class="confirm glass hidden">
+  <p id="confirmText"></p>
+  <div class="confirm-actions">
+    <button id="confirmOk" class="btn primary">OK</button>
+    <button id="confirmCancel" class="btn ghost">Cancel</button>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

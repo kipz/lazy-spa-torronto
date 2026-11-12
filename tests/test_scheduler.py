@@ -303,5 +303,47 @@ class TestFormatting(unittest.TestCase):
         self.assertIn("09:30", out)
 
 
+# --- scheduler_step (shared unit used by CLI run + web server) ---------------
+class TestSchedulerStep(unittest.TestCase):
+    def _mock_weather(self):
+        weather = {}
+        for i in range(48):
+            ts = ANCHOR_TS + i * 3600
+            weather[ts - (ts % 3600)] = (5.0, 0.0, 0.0)
+        return weather
+
+    def test_step_returns_plan_without_applying(self):
+        cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28)
+        mock_spa = mock.MagicMock()
+        mock_spa.shadow.return_value = {
+            "water_temperature": 40, "power_state": 1,
+            "temperature_setting": 40, "heater_state": 6, "filter_state": 2}
+        with mock.patch.dict(sys.modules, {"spa": mock_spa}), \
+             mock.patch.object(scheduler, "fetch_forecast",
+                               return_value=self._mock_weather()):
+            res = scheduler.scheduler_step(cfg, 51.5, -0.12, apply=False)
+        self.assertIn("phase", res)
+        self.assertIn("setting", res)
+        self.assertEqual(res["water_temp"], 40)
+        self.assertEqual(len(res["plan_ts"]), len(res["plan_us"]))
+        self.assertFalse(res["changed"])  # apply=False -> no commands sent
+        mock_spa.send_command.assert_not_called()
+
+    def test_step_applies_in_auto(self):
+        cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28)
+        mock_spa = mock.MagicMock()
+        mock_spa.shadow.return_value = {
+            "water_temperature": 40, "power_state": 0,
+            "temperature_setting": 40, "heater_state": 6, "filter_state": 2}
+        with mock.patch.dict(sys.modules, {"spa": mock_spa}), \
+             mock.patch.object(scheduler, "fetch_forecast",
+                               return_value=self._mock_weather()):
+            res = scheduler.scheduler_step(cfg, 51.5, -0.12, apply=True)
+        # water already at/above target in-window -> power_state forced on
+        self.assertTrue(res["changed"])
+        calls = [c[0] for c in mock_spa.send_command.call_args_list]
+        self.assertIn(("power_state", 1), [(dp, v) for _, dp, v in calls])
+
+
 if __name__ == "__main__":
     unittest.main()

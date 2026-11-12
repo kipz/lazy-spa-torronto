@@ -434,47 +434,77 @@ def hot_phase_now(series, us, windows):
     return "eco"
 
 
+def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True):
+    """Run one hourly scheduler step: fetch weather -> replan -> (optionally) apply.
+
+    Returns a dict: {phase, setting, water_temp, ambient_now, plan_ts, plan_us,
+    plan_amb, energy_kwh, changed}. This is the shared unit used by both the
+    CLI `run` loop and the web server's scheduler thread.
+    """
+    import spa  # reuses auth/command machinery
+    weather = fetch_forecast(lat, lon)
+    t0 = time.time()
+    series = forecast_series(cfg, weather, t0)
+    if state is None:
+        state = spa.shadow(tokens if tokens is not None else spa.get_tokens())
+    T0 = state.get("water_temperature")
+    if not isinstance(T0, (int, float)):
+        T0 = cfg["ECO_TEMP"]
+    windows = windows_from_config(cfg)
+    us, energy, _ = optimal_start(cfg, series, T0, windows)
+    phase = hot_phase_now(series, us, windows)
+    setting = int(cfg["TARGET_TEMP"]) if phase in ("window", "preheat") else int(cfg["ECO_TEMP"])
+    changed = False
+    if apply:
+        if int(state.get("power_state") or 0) != 1:
+            spa.send_command(tokens, "power_state", 1)
+            changed = True
+        if int(state.get("temperature_setting") or 0) != setting:
+            spa.send_command(tokens, "temperature_setting", setting)
+            changed = True
+        if not state.get("heater_state"):
+            spa.send_command(tokens, "heater_state", 1)
+            changed = True
+        if int(state.get("filter_state") or 0) == 0:
+            spa.send_command(tokens, "filter_state", 1)
+            changed = True
+    return {
+        "phase": phase,
+        "setting": setting,
+        "water_temp": T0,
+        "ambient_now": series[0][1],
+        "plan_ts": [s[0] for s in series],
+        "plan_amb": [s[1] for s in series],
+        "plan_us": us,
+        "energy_kwh": energy,
+        "changed": changed,
+        "series_start": series[0][0],
+    }
+
+
 def run_controller(cfg, lat, lon, dry_run=False):
-    """Persistent loop: every hour, fetch weather -> replan -> apply via spa.py.
+    """Persistent loop: every hour, run a scheduler step via scheduler_step.
 
     Controls temperature_setting (TARGET during use windows / preheat, ECO
     otherwise) and lets the spa's own thermostat run the heater -- switching
     the setpoint is gentler and more accurate than toggling heater_state.
     """
-    import spa  # reuses auth/command machinery
-    tokens = spa.get_tokens() if not dry_run else None
-    windows = windows_from_config(cfg)
+    tokens = None if dry_run else __import__("spa").get_tokens()
     log_path = os.path.join(BASE_DIR, cfg["LOG_FILE"])
     last_setting = None
     while True:
         t0 = time.time()
         try:
-            weather = fetch_forecast(lat, lon)
-            series = forecast_series(cfg, weather, t0)
-            if dry_run:
-                state = spa.shadow(spa.get_tokens())
-            else:
-                state = spa.shadow(tokens)
-            T0 = state.get("water_temperature")
-            if not isinstance(T0, (int, float)):
-                T0 = cfg["ECO_TEMP"]
-            us, _, _ = optimal_start(cfg, series, T0, windows)
-            phase = hot_phase_now(series, us, windows)
-            setting = int(cfg["TARGET_TEMP"]) if phase in ("window", "preheat") else int(cfg["ECO_TEMP"])
-            line = "[%s] T=%gC phase=%s temp_setting=%d next=%s" % (
-                time.strftime("%F %T"), T0, phase, setting, fmt_hm(series[0][0]))
-            if setting != last_setting:
-                if not dry_run:
-                    if int(state.get("power_state") or 0) != 1:
-                        spa.send_command(tokens, "power_state", 1)
-                    if int(state.get("temperature_setting") or 0) != setting:
-                        spa.send_command(tokens, "temperature_setting", setting)
-                    if not state.get("heater_state"):
-                        spa.send_command(tokens, "heater_state", 1)
-                    if int(state.get("filter_state") or 0) == 0:
-                        spa.send_command(tokens, "filter_state", 1)
-                line += "  [would set temp_setting=%d]" % setting if dry_run else "  [applied temp_setting=%d]" % setting
-                last_setting = setting
+            res = scheduler_step(cfg, lat, lon, tokens=tokens, apply=not dry_run)
+            action = ""
+            if res["changed"]:
+                action = ("  [would set temp_setting=%d]" if dry_run
+                          else "  [applied temp_setting=%d]") % res["setting"]
+            line = "[%s] T=%gC phase=%s temp_setting=%d next=%s%s" % (
+                time.strftime("%F %T"), res["water_temp"], res["phase"],
+                res["setting"], fmt_hm(res["series_start"]), action)
+            if res["setting"] != last_setting or res["changed"]:
+                last_setting = res["setting"]
             with open(log_path, "a") as f:
                 f.write(line + "\n")
             print(line, flush=True)

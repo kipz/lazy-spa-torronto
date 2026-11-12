@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Syntax check
-        run: python -m compileall -q spa.py scheduler.py tests
+        run: python -m compileall -q spa.py scheduler.py server.py tests
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
       - name: Scheduler selftest

@@ -26,7 +26,8 @@ Reverse-engineered protocol for the **Lay-Z-Spa Toronto AirJet Plus (UltraFit)**
 | 🧪 **Reverse-engineered** | Login route, MD5 password quirk, signing scheme — all from `libapp.so` |
 | ⌨️ **Full control** | Power, heat, filter, AirJet, HydroJet, lock, target temp |
 | 🌡️ **Smart heating** | Weather-aware scheduler preheats to 40 °C by window start, kWh-optimised |
-| 🧩 **Zero dependencies** | Pure Python stdlib, two files (`spa.py` + `scheduler.py`) |
+| 🕸️ **Web UI** | Zero-dep single-page app: live gauge, history chart, full controls, auto-heat |
+| 🧩 **Zero dependencies** | Pure Python stdlib, three files (`spa.py` + `scheduler.py` + `server.py`) |
 | 🔐 **Cached auth** | Login once, tokens cached — no repeated logins that kill the app session |
 | 📡 **Live monitoring** | `watch` polls the cloud shadow and prints on change |
 
@@ -41,6 +42,7 @@ python3 spa.py wave on               # bubbles on 🌊
 python3 spa.py watch                 # poll every 15s, print on change
 python3 scheduler.py plan            # energy-optimal 48h heating plan (Open-Meteo)
 python3 scheduler.py run             # apply it continuously (see SCHEDULER.md)
+python3 server.py                    # web UI + API at http://localhost:8080/ (see WEB.md)
 ```
 
 ## 🕹️ Commands
@@ -166,7 +168,6 @@ python scheduler.py selftest              # policy sanity checks
 compile check → unit tests → scheduler selftest → offline simulation. Actions
 are pinned to commit SHAs and the workflow runs with `contents: read` only.
 See [`SECURITY.md`](SECURITY.md) for the security policy.
-
 ## 📚 Documentation
 
 | File | Contents |
@@ -175,6 +176,7 @@ See [`SECURITY.md`](SECURITY.md) for the security policy.
 | [`RESEARCH_LOG.md`](RESEARCH_LOG.md) | Chronological RE session log, incl. all dead ends |
 | [`SENSOR_HACK.md`](SENSOR_HACK.md) | Engineering deep-dive: beating the 40°C cap |
 | [`SCHEDULER.md`](SCHEDULER.md) | Weather-aware heating scheduler: model, optimality, usage |
+| [`WEB.md`](WEB.md) | Web server + SPA: features, API, modes, security |
 | [`COMMUNITY_POST.md`](COMMUNITY_POST.md) | Ready-to-paste writeup for issue #88 |
 | [`docs/datapoints-FTEW0E.json`](docs/datapoints-FTEW0E.json) | Official manufacturer datapoint definition |
 | [`SECURITY.md`](SECURITY.md) | Vulnerability reporting & hardening notes |

@@ -11,3 +11,6 @@ local_device.md
 scheduler.env
 scheduler_model.json
 scheduler.log
+
+# web server: local config
+web.env

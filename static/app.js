@@ -393,6 +393,15 @@ function renderConfig() {
   const ov = d.overrides || {};
   const active = DAYS.filter((day) => ov[day]).map((day) => day + " " + ov[day]);
   $("#cfgOverrides").textContent = active.length ? active.join(", ") : "none";
+  const loc = (d.location || "").trim();
+  $("#cfgLocation").textContent = loc
+    + (d.lat != null && d.lon != null ? ` (${d.lat}, ${d.lon})` : "");
+  const m = d.model || {};
+  $("#cfgModel").textContent = `UA ${m.ua} · P ${m.p} kW`
+    + (m.samples ? ` · ${m.samples} samples` : "");
+  const src = (m.source || "default");
+  $("#cfgModelSrc").textContent = src;
+  $("#cfgModelSrc").className = "model-badge " + (src === "default" ? "def" : "fitted");
   if (d.phase) {
     state.phase = d.phase;
     $("#factPhase").textContent = d.phase.toUpperCase();
@@ -425,6 +434,10 @@ function openSettings() {
   $("#setEco").value = c.eco != null ? c.eco : 28;
   $("#setFloor").value = c.floor != null ? c.floor : 8;
   $("#setMargin").value = c.margin != null ? c.margin : 0;
+  // Location field: reflect current location; keep pinned coords in the payload.
+  $("#setLocation").value = c.location || "";
+  state._locPicked = c.lat != null && c.lon != null ? { lat: c.lat, lon: c.lon } : null;
+  hideLocSuggest();
   DAYS.forEach((day) => { $("#setWin" + day).value = ov[day] || ""; });
   $("#settingsError").textContent = "";
   $("#settingsModal").classList.remove("hidden");
@@ -469,6 +482,16 @@ async function saveSettings(e) {
     overrides: {},
   };
   DAYS.forEach((day) => { payload.overrides[day] = $("#setWin" + day).value.trim(); });
+  // Location: include only if the user changed/typed something.
+  const locText = $("#setLocation").value.trim();
+  if (locText) {
+    payload.location = state._locPicked ? state._locPicked.label || locText : locText;
+    if (state._locPicked) {
+      payload.lat = state._locPicked.lat;
+      payload.lon = state._locPicked.lon;
+    }
+  }
+  hideLocSuggest();
 
   const problem = validateSettings(payload);
   if (problem) {
@@ -502,6 +525,75 @@ async function saveSettings(e) {
     btn.disabled = false;
     btn.textContent = oldText;
   }
+}
+
+/* ---------------- location type-ahead ---------------- */
+let _locTimer = null;
+
+function hideLocSuggest() {
+  $("#locSuggest").classList.add("hidden");
+  $("#locSuggest").innerHTML = "";
+}
+
+async function searchLocations(query) {
+  const q = String(query || "").trim();
+  if (q.length < 2) { hideLocSuggest(); return; }
+  try {
+    const d = await api("/api/location/search?q=" + encodeURIComponent(q));
+    const results = d.results || [];
+    const box = $("#locSuggest");
+    box.innerHTML = "";
+    if (!results.length) {
+      box.classList.add("hidden");
+      return;
+    }
+    results.forEach((r) => {
+      const li = document.createElement("li");
+      li.setAttribute("role", "option");
+      li.textContent = r.label;
+      li.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        state._locPicked = { label: r.label, lat: r.lat, lon: r.lon };
+        $("#setLocation").value = r.label;
+        hideLocSuggest();
+      });
+      box.appendChild(li);
+    });
+    box.classList.remove("hidden");
+  } catch (err) {
+    hideLocSuggest();
+  }
+}
+
+function onLocationInput() {
+  state._locPicked = null;                 // typed text -> free-form geocode
+  clearTimeout(_locTimer);
+  const q = $("#setLocation").value;
+  if (q.trim().length < 2) { hideLocSuggest(); return; }
+  _locTimer = setTimeout(() => searchLocations(q), 220);
+}
+
+function bindSettings() {
+  $("#settingsBtn").addEventListener("click", openSettings);
+  $("#settingsCancel").addEventListener("click", closeSettings);
+  $("#settingsForm").addEventListener("submit", saveSettings);
+  const loc = $("#setLocation");
+  if (loc) {
+    loc.addEventListener("input", onLocationInput);
+    loc.addEventListener("blur", () => setTimeout(hideLocSuggest, 150));
+    loc.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") hideLocSuggest();
+      if (e.key === "Enter" && !$("#locSuggest").classList.contains("hidden")) {
+        const first = $("#locSuggest").querySelector("li");
+        if (first) first.click();
+      }
+    });
+  }
+  $("#locClear").addEventListener("click", () => {
+    $("#setLocation").value = "";
+    state._locPicked = null;
+    hideLocSuggest();
+  });
 }
 
 /* ---------------- operation log ---------------- */
@@ -667,9 +759,7 @@ function bindEvents() {
     } catch (e) { toast(e.message, "err"); }
   });
 
-  $("#settingsBtn").addEventListener("click", openSettings);
-  $("#settingsCancel").addEventListener("click", closeSettings);
-  $("#settingsForm").addEventListener("submit", saveSettings);
+  bindSettings();
   $("#opClose").addEventListener("click", closeOpModal);
   $("#settingsModal").addEventListener("click", (e) => {
     if (e.target.id === "settingsModal") closeSettings();

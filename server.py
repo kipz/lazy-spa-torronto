@@ -21,6 +21,7 @@ import datetime as dt
 import json
 import os
 import re
+import statistics
 import sys
 import threading
 import time
@@ -31,8 +32,17 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 POLL_SECONDS = 15.0
 HISTORY_SECONDS = 7 * 86400        # keep ~1 week of history in memory
-SAMPLE_SECONDS = 60                # throttle JSONL appends to 1/min
+SHADOW_LOG_SECONDS = 300           # append one shadow snapshot to JSONL per 5 min
 LOG_MAX = 300                      # operation log entries kept in memory
+# Online cooling-rate (UA) estimate from real heater-off coast-downs. Spans
+# are long enough to rise above the spa's 1 C temperature resolution.
+UA_MIN_SAMPLES = 3                 # samples needed before the model is updated
+UA_SAMPLE_MIN_S = 7200             # 2 h between the two observation points
+UA_SAMPLE_MAX_S = 4 * 3600         # discard longer gaps (weather changed too much)
+UA_SAMPLE_MAX_N = 50               # rolling median window
+UA_BOUNDS = (0.005, 0.3)           # kW/degC, sane physical range
+UA_AMBIENT_MIN_DIFF = 3.0          # need a clear water/ambient difference
+UA_SETPOINT_MARGIN = 1.0           # only fit well above setpoint (thermostat idle)
 DAY_NAMES = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 WINDOW_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$")
 DP_LOG_LABELS = {
@@ -90,6 +100,10 @@ def scheduler_payload(app):
         "eco": int(cfg["ECO_TEMP"]),
         "floor": int(cfg["FLOOR_TEMP"]),
         "margin": float(cfg["MARGIN"]),
+        "location": cfg["LOCATION"],
+        "lat": cfg["LAT"] if cfg["LAT"] is not None else app._lat,
+        "lon": cfg["LON"] if cfg["LON"] is not None else app._lon,
+        "model": scheduler.model_info(cfg),
         "phase": app._plan["phase"] if app._plan else None,
         "setting": app._plan["setting"] if app._plan else None,
     }
@@ -131,7 +145,10 @@ class SpaServer:
         self._history = []          # [{ts, water, target, heater, ambient?}]
         self._lock = threading.Lock()
         self._sse_clients = set()
-        self._last_sample = 0.0
+        self._last_shadow_log = 0.0
+        self._ua_prev = None        # anchor sample for the cooling-rate estimate
+        self._ua_samples = []       # recent coast-down UA estimates (kW/degC)
+        self._amb = {}              # ts -> forecast ambient, kept across plans
         self._plan = None           # latest scheduler_step() result
         self._plan_ts = 0.0
         self._tokens = None
@@ -170,6 +187,8 @@ class SpaServer:
                         h["ambient"] = amb_map.get(h["ts"])
             self._history = [h for h in self._history
                              if h["ts"] > now - HISTORY_SECONDS]
+        self._maybe_log_shadow(state)
+        self._maybe_sample_ua(state)
         self._broadcast("state")
 
     def get_state(self):
@@ -180,6 +199,115 @@ class SpaServer:
         cutoff = int(time.time()) - int(hours * 3600)
         with self._lock:
             return [dict(h) for h in self._history if h["ts"] >= cutoff]
+
+    # -- thermal model (automatic cooling-rate measurement) -----------------
+    def _maybe_log_shadow(self, state):
+        now = time.time()
+        if now - self._last_shadow_log < SHADOW_LOG_SECONDS:
+            return
+        self._last_shadow_log = now
+        path = os.path.join(BASE_DIR, "shadow_log.jsonl")
+        try:
+            with open(path, "a") as f:
+                f.write(json.dumps({"ts": int(now), "shadow": state},
+                                   separators=(",", ":")) + "\n")
+        except OSError as e:
+            self.add_log("err", "Could not append shadow log: %s" % e)
+
+    def _maybe_sample_ua(self, state):
+        """Estimate the heat-loss coefficient (UA) from real coast-downs.
+
+        Pairs shadow readings roughly two hours apart while the tub is well
+        above its setpoint (so the thermostat cannot have been heating), and
+        keeps a rolling median. Once enough samples exist the fitted value is
+        saved to scheduler_model.json and used by the next replan.
+        """
+        now = int(time.time())
+        water = state.get("water_temperature")
+        try:
+            power = int(state.get("power_state") or 0)
+        except (TypeError, ValueError):
+            power = 0
+        cur = {
+            "ts": now,
+            "water": water if isinstance(water, (int, float)) else None,
+            "setpoint": state.get("temperature_setting"),
+            "power": power,
+            "ambient": self._amb.get(now - now % 3600),
+        }
+        prev = self._ua_prev
+        if prev is None:
+            self._ua_prev = cur
+            return
+        dt_s = now - prev["ts"]
+        if dt_s < UA_SAMPLE_MIN_S:
+            return
+        self._ua_prev = cur
+        if dt_s > UA_SAMPLE_MAX_S:
+            return
+        if prev["water"] is None or cur["water"] is None:
+            return
+        if prev["power"] != 1 or cur["power"] != 1:
+            return
+        sp1, sp2 = prev["setpoint"], cur["setpoint"]
+        if not isinstance(sp1, (int, float)) or not isinstance(sp2, (int, float)):
+            return
+        if state.get("heater_state") in (1, 2, 3):   # actively heating now
+            return
+        t1, t2 = float(prev["water"]), float(cur["water"])
+        if min(t1, t2) <= max(sp1, sp2) + UA_SETPOINT_MARGIN:
+            return  # thermostat may have called for heat during the span
+        dT = t2 - t1
+        if dT > -0.5:
+            return  # no clear cooling at 1 C sensor resolution
+        t_amb = prev["ambient"]
+        if not isinstance(t_amb, (int, float)):
+            return
+        if isinstance(cur["ambient"], (int, float)):
+            t_amb = (t_amb + cur["ambient"]) / 2.0
+        t_avg = (t1 + t2) / 2.0
+        if abs(t_avg - t_amb) <= UA_AMBIENT_MIN_DIFF:
+            return
+        dt_h = dt_s / 3600.0
+        ua = (self.cfg.scheduler_cfg["C_KWH_PER_C"] * (-dT / dt_h)
+              / (t_avg - t_amb))
+        if not (UA_BOUNDS[0] <= ua <= UA_BOUNDS[1]):
+            return
+        self._ua_samples.append(ua)
+        if len(self._ua_samples) > UA_SAMPLE_MAX_N:
+            del self._ua_samples[:-UA_SAMPLE_MAX_N]
+        if len(self._ua_samples) < UA_MIN_SAMPLES:
+            return
+        new_ua = statistics.median(self._ua_samples)
+        old_ua = float(self.cfg.scheduler_cfg["UA_KW_PER_C"])
+        if abs(new_ua - old_ua) < 0.001:
+            return
+        self.cfg.scheduler_cfg["UA_KW_PER_C"] = new_ua
+        self._save_model_ua(new_ua)
+        self.add_log("info",
+                     "Cooling rate measured: UA=%.4f kW/°C from %d coast-downs"
+                     % (new_ua, len(self._ua_samples)))
+
+    def _save_model_ua(self, ua):
+        path = os.path.join(BASE_DIR, "scheduler_model.json")
+        model = {}
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    model = json.load(f)
+            except (OSError, ValueError):
+                model = {}
+        model.update({"UA_KW_PER_C": ua,
+                      "fitted_from": len(self._ua_samples),
+                      "ua_samples": len(self._ua_samples),
+                      "source": "online coast-down",
+                      "saved_at": int(time.time())})
+        try:
+            with open(path, "w") as f:
+                json.dump(model, f, indent=2)
+            os.chmod(path, 0o600)
+        except OSError as e:
+            self.add_log("err", "Could not save thermal model: %s" % e)
 
     # -- operation log -----------------------------------------------------
     def add_log(self, level, msg):
@@ -221,6 +349,12 @@ class SpaServer:
             tokens=self._get_tokens(), apply=apply)
         self._plan = res
         self._plan_ts = time.time()
+        # Keep forecast ambient for hours that have just left the plan window,
+        # so the cooling-rate sampler can still look up its older anchor.
+        for ts, amb in zip(res.get("plan_ts") or [], res.get("plan_amb") or []):
+            self._amb[ts] = amb
+        cutoff = time.time() - 72 * 3600
+        self._amb = {ts: a for ts, a in self._amb.items() if ts >= cutoff}
         if apply and res.get("changed"):
             self.add_log("info", "Auto mode applied target %d°C (%s phase)"
                          % (int(res.get("setting") or 0), res.get("phase") or "?"))
@@ -291,6 +425,36 @@ class SpaServer:
         if "window" in payload:
             env["WINDOW"] = validate_window(payload["window"])
 
+        # Location: accept a geocoded choice (lat/lon) or resolve free text.
+        location_changed = False
+        if "location" in payload:
+            label = str(payload.get("location") or "").strip()
+            if not label:
+                raise ValueError("location must not be empty")
+            lat, lon = payload.get("lat"), payload.get("lon")
+            if lat not in (None, "") and lon not in (None, ""):
+                lat = _float_setting("latitude", lat, -90, 90)
+                lon = _float_setting("longitude", lon, -180, 180)
+                new_location = label
+            else:
+                try:
+                    hits = scheduler.geocode(label, 1)
+                except Exception as e:
+                    raise ValueError("could not look up location: %s" % e)
+                if not hits:
+                    raise ValueError("location not found: %r" % label)
+                hit = hits[0]
+                lat, lon = hit["lat"], hit["lon"]
+                new_location = hit["label"] or label
+            old_lat, old_lon = cur.get("LAT"), cur.get("LON")
+            location_changed = (
+                new_location != cur.get("LOCATION")
+                or old_lat is None or old_lon is None
+                or abs(lat - old_lat) > 1e-6 or abs(lon - old_lon) > 1e-6)
+            env["LOCATION"] = new_location
+            env["LAT"] = "%.5f" % lat
+            env["LON"] = "%.5f" % lon
+
         overrides = payload.get("overrides") or {}
         if not isinstance(overrides, dict):
             raise ValueError("overrides must be an object")
@@ -314,6 +478,18 @@ class SpaServer:
 
         self.cfg.scheduler_cfg = scheduler.load_config()
         cfg = self.cfg.scheduler_cfg
+
+        if location_changed:
+            # Re-resolve where we are and drop ambient/coast-down caches that
+            # were keyed on the old location's weather.
+            try:
+                self._lat, self._lon, self._where = \
+                    scheduler.resolve_location(cfg)
+            except SystemExit as e:
+                raise ValueError("location not usable: %s" % e)
+            self._amb = {}
+            self._ua_prev = None
+
         summary = ("window %s, target %d°C, eco %d°C, floor %d°C, margin %g°C"
                    % (cfg["WINDOW"], int(cfg["TARGET_TEMP"]), int(cfg["ECO_TEMP"]),
                       int(cfg["FLOOR_TEMP"]), float(cfg["MARGIN"])))
@@ -325,6 +501,9 @@ class SpaServer:
         except Exception as e:
             plan_error = str(e)
 
+        if location_changed:
+            summary += "; location %s (%.4f, %.4f)" % (
+                cfg["LOCATION"], self._lat, self._lon)
         self.add_log("ok" if not plan_error else "warn",
                      "Heating settings updated — %s%s"
                      % (summary, "" if not plan_error else " (replan failed)"))
@@ -350,7 +529,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
         if path in ("/api/state", "/api/health", "/api/history", "/api/plan",
-                    "/api/scheduler", "/api/weather", "/api/log"):
+                    "/api/scheduler", "/api/weather", "/api/log",
+                    "/api/location/search"):
             self._api(path)
         elif path == "/api/events":
             self._sse()
@@ -419,6 +599,13 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError:
                 limit = 100
             self._send_json(200, {"entries": app.get_log(max(1, min(limit, LOG_MAX)))})
+        elif path == "/api/location/search":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            query = (qs.get("q") or [""])[0]
+            try:
+                self._send_json(200, {"results": scheduler.geocode(query, 8)})
+            except Exception as e:
+                self._send_json(502, {"error": "location search failed: %s" % e})
         elif path == "/api/weather":
             try:
                 weather = scheduler.fetch_forecast(app._lat, app._lon, forecast_days=2)

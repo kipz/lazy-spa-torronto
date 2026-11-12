@@ -100,17 +100,34 @@ appended to `scheduler.log` per cycle.
   because they measure loss-compensating power, not heater output
 
 Fits need ≥3 clean samples each; otherwise the config defaults are kept.
-Results are written to `scheduler_model.json` (gitignored) and loaded by `run`.
+Results are written to `scheduler_model.json` (gitignored).
 
-For the best fit: run `python3 spa.py watch --raw --interval 300 >> shadow_log.jsonl`
-through one full overnight coast (heater off) plus one heating cycle.
+`scheduler.load_config()` merges `scheduler_model.json` for every consumer —
+`plan`, `run` and the web server — so they always share the same parameters.
+
+### Automatic UA measurement in the web server
+
+The web server also fits `UA` continuously from real experience, with no manual
+step: every ~2 h it pairs shadow readings taken while the water is more than
+1 °C above its setpoint (so the thermostat cannot have been heating) and the
+heater is not active. Each pair yields a coast-down estimate
+`UA = C·(−dT/dt)/(T−T_amb)` using the cached forecast ambient. After three
+samples the rolling median is written to `scheduler_model.json`, applied to the
+config, and recorded in the operation log. Snapshots are persisted to
+`shadow_log.jsonl` every 5 minutes, so the data survives restarts.
+
+For a full fit (including `P`) run
+`python3 spa.py watch --raw --interval 300 >> shadow_log.jsonl` through one
+overnight coast plus one heating cycle, then `scheduler.py calibrate`.
 
 ## Weather & privacy
 
 - Forecast: `api.open-meteo.com` — free, no key, CC BY 4.0 attribution; UKMO
   model auto-selected for UK locations, updates hourly, 16-day horizon.
 - Geocoding: `geocoding-api.open-meteo.com` resolves `LOCATION` (city or
-  postcode) to lat/lon; or set `LAT=`/`LON=` directly.
+  postcode) to lat/lon; or set `LAT=`/`LON=` directly. The web UI edits the
+  location with type-ahead (proxied through `GET /api/location/search`); a
+  picked suggestion pins its coordinates, free text is geocoded on save.
 - `LOCATION`, the fitted model, and the runtime log are all in gitignored
   files (`scheduler.env`, `scheduler_model.json`, `scheduler.log`) — nothing
   location-specific is committed.

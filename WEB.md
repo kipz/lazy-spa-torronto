@@ -19,8 +19,8 @@ Open `http://<host>:8080/` in a browser.
 | **Gauge** | Current water temp, target badge, pulsing heater indicator |
 | **Chart** | Water temp vs ambient vs target over 6h/24h/3d/7d; hover tooltip; heater-on bands |
 | **Controls** | Power, heat, filter, bubbles, jet, lock toggles; 20–40 °C target slider |
-| **Auto-heating** | Manual ⇄ Auto mode switch, live phase (eco/preheat/window), 24 h heater-on plan strip, replan button, config summary |
-| **Settings** | Edit the default/per-day use windows, target/eco/floor temperatures and margin from the UI |
+| **Auto-heating** | Manual ⇄ Auto mode switch, live phase (eco/preheat/window), 24 h heater-on plan strip, replan button, config summary incl. location and learned model |
+| **Settings** | Edit the default/per-day use windows, target/eco/floor temperatures, margin, and location (type-ahead + validation) from the UI |
 | **Feedback** | Command progress modal (sent → confirmed by status), AUTO lock hints, and a live operation log |
 | **Weather** | Next-24 h forecast strip + ambient in chart/facts |
 
@@ -53,9 +53,10 @@ Switching to Auto while mid-preheat asks for confirmation.
 | GET | `/api/state` | Live shadow + mode + phase + setting |
 | GET | `/api/history?range=24` | Water/target/heater/ambient series (hours) |
 | GET | `/api/plan` | 48 h optimal-start heater plan + energy |
-| GET | `/api/scheduler` | Mode, windows, per-day overrides, target/eco/floor/margin |
+| GET | `/api/scheduler` | Mode, windows, per-day overrides, target/eco/floor/margin, location + lat/lon, measured model (`ua`, `p`, samples, source) |
 | POST | `/api/scheduler` | `{"mode":"auto"\|"manual"}`, `{"replan":true}`, or `{"config":{...}}` |
 | GET | `/api/weather` | Next-24 h forecast |
+| GET | `/api/location/search?q=...` | Geocoding type-ahead suggestions for the location editor |
 | POST | `/api/cmd` | `{"datapoint","value"}` — clamped 20–40, temp rejected in auto |
 | GET | `/api/health` | Connectivity, last update age |
 | GET | `/api/log?limit=100` | Recent server-side operations |
@@ -67,14 +68,29 @@ A config update looks like:
 {"config": {
   "window": "17:00-23:00",
   "target": 40, "eco": 28, "floor": 8, "margin": 0,
-  "overrides": {"SAT": "14:00-23:00", "SUN": ""}
+  "overrides": {"SAT": "14:00-23:00", "SUN": ""},
+  "location": "London, England, United Kingdom", "lat": 51.5074, "lon": -0.1278
 }}
 ```
 
-It is validated (HH:MM windows, `floor ≤ eco ≤ target`, device temp clamp),
-saved to `scheduler.env`, and immediately replanned. A window whose end is
-earlier than its start is an overnight window: `22:00-01:00` runs from 22:00
-on its configured day until 01:00 the next morning. Start and end must differ.
+It is validated (HH:MM windows, `floor ≤ eco ≤ target`, device temp clamp,
+latitude −90…90, longitude −180…180), saved to `scheduler.env`, and
+immediately replanned. A window whose end is earlier than its start is an
+overnight window: `22:00-01:00` runs from 22:00 on its configured day until
+01:00 the next morning. Start and end must differ.
+
+**Location** accepts either a picked suggestion (`location` + `lat`/`lon`,
+which pin the exact coordinates) or free text (`location` only), which is
+geocoded on save and stored as its canonical name plus coordinates. The
+suggestion list comes from `GET /api/location/search?q=...` (proxied through
+the server so the browser never calls Open-Meteo directly). A location change
+re-resolves the lat/lon, clears the ambient and cooling-rate caches, and is
+logged with its coordinates.
+
+The `/api/scheduler` payload carries the full current state, including the
+`model` object: the `UA` cooling rate and `P` heater power currently in use,
+the number of `ua_samples`, the `source` (`default`, `calibrated`, or
+`online coast-down`) and when it was last saved.
 
 Command datapoints: `power_state`, `heater_state`, `filter_state`,
 `wave_state`, `hydrojet_state`, `locked`, `temperature_setting` (aliases
@@ -84,11 +100,19 @@ Command datapoints: `power_state`, `heater_state`, `filter_state`,
 
 `server.py` (stdlib `ThreadingHTTPServer`) runs three background threads:
 
-1. **Poller** — fetches the shadow every 15 s, appends to `shadow_log.jsonl`
-   history, and refreshes the heating plan (apply only in Auto mode).
+1. **Poller** — fetches the shadow every 15 s, keeps 7 days in memory, persists
+   a snapshot to `shadow_log.jsonl` every 5 minutes, and refreshes the heating
+   plan (apply only in Auto mode).
 2. **Scheduler thread** — reuses `scheduler.scheduler_step()` from
    `scheduler.py` (weather → optimal-start plan → temperature_setting).
 3. **SSE** — pushes state/plan/mode events to the browser so the UI is live.
+
+The poller also measures the tub's real cooling rate (`UA`) from overnight
+coast-downs: it pairs shadow readings ~2 h apart while the water is well above
+its setpoint, keeps a rolling median, and saves it to `scheduler_model.json`.
+After three samples the next replan uses the measured value; each update is
+written to the operation log. `scheduler.load_config()` merges that model, so
+the CLI and web server share the same fitted parameters.
 
 The frontend is hand-rolled vanilla HTML/CSS/JS (no npm, no CDN, no build
 step). The chart is a custom `<canvas>` renderer with `requestAnimationFrame`.

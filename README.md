@@ -94,7 +94,7 @@ flowchart LR
 | `scheduler.py plan --simulate` | Offline demo with synthetic weather |
 | `scheduler.py run` | Persistent controller (applies to the spa) |
 | `scheduler.py run --dry-run` | Log what it would do, touch nothing |
-| `scheduler.py calibrate` | Fit `UA`/`P` from `shadow_log.jsonl` + historical weather |
+| `scheduler.py calibrate` | Fit `UA`/`P` from `shadow_log.jsonl` + historical weather (the web server also fits `UA` automatically from overnight coast-downs) |
 | `scheduler.py selftest` | Physics sanity checks |
 
 **Config** (`scheduler.env`, gitignored):
@@ -115,9 +115,11 @@ thermostats call "optimal start"). Full derivation in [`SCHEDULER.md`](SCHEDULER
 </details>
 
 > [!NOTE]
-> **Calibrate it for accuracy.** Defaults (`UA=0.03 kW/°C`, `P=2 kW`) work, but
-> running `scheduler.py calibrate` after one overnight coast + heating cycle
-> fits your tub's real numbers and tightens preheat timing.
+> **It learns the cooling rate by itself.** Defaults (`UA=0.03 kW/°C`, `P=2 kW`)
+> work, but the web server watches real overnight coast-downs, fits `UA` from
+> them automatically (rolling median, ≥3 samples, written to
+> `scheduler_model.json`), and logs each update. Run `scheduler.py calibrate`
+> if you also want to fit heater power from a full heating cycle.
 
 ## 🕸️ Web UI
 

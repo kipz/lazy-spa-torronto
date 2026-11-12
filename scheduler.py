@@ -104,15 +104,83 @@ def load_config():
         except (TypeError, ValueError):
             pass
     cfg["HORIZON_H"] = int(cfg["HORIZON_H"])
-    if cfg["LAT"] and cfg["LON"]:
-        cfg["LAT"] = float(cfg["LAT"])
-        cfg["LON"] = float(cfg["LON"])
+    # Calibrated (or online-measured) thermal parameters override the
+    # scheduler.env/default guesses. This keeps the CLI and the web server
+    # using the same fitted model.
+    model_path = os.path.join(BASE_DIR, "scheduler_model.json")
+    if os.path.exists(model_path):
+        try:
+            with open(model_path) as f:
+                model = json.load(f)
+        except (OSError, ValueError):
+            model = {}
+        for key in ("UA_KW_PER_C", "P_HEAT_KW"):
+            val = model.get(key)
+            if isinstance(val, (int, float)):
+                cfg[key] = float(val)
+    if cfg["LAT"] not in (None, "") and cfg["LON"] not in (None, ""):
+        try:
+            cfg["LAT"] = float(cfg["LAT"])
+            cfg["LON"] = float(cfg["LON"])
+        except (TypeError, ValueError):
+            cfg["LAT"] = cfg["LON"] = None
     else:
         cfg["LAT"] = cfg["LON"] = None
     return cfg
 
 
+def model_info(cfg):
+    """Describe the thermal parameters currently in use and their origin."""
+    info = {
+        "ua": round(float(cfg["UA_KW_PER_C"]), 4),
+        "p": round(float(cfg["P_HEAT_KW"]), 2),
+        "samples": 0,
+        "source": "default",
+        "saved_at": None,
+    }
+    path = os.path.join(BASE_DIR, "scheduler_model.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                model = json.load(f)
+        except (OSError, ValueError):
+            model = {}
+        if model:
+            info["samples"] = int(model.get("ua_samples") or 0)
+            info["source"] = model.get("source") or "calibrated"
+            info["saved_at"] = model.get("saved_at")
+    return info
+
+
 # --- location ----------------------------------------------------------------
+def geocode(query, count=8):
+    """Return place suggestions for the UI (Open-Meteo geocoding)."""
+    query = str(query or "").strip()
+    if len(query) < 2:
+        return []
+    res = http_get_json(GEOCODE_URL, {
+        "name": query, "count": int(count), "language": "en", "format": "json"})
+    out, seen = [], set()
+    for h in res.get("results") or []:
+        try:
+            lat, lon = float(h["latitude"]), float(h["longitude"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        key = (round(lat, 3), round(lon, 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        name = h.get("name") or query
+        admin = h.get("admin1") or ""
+        country = h.get("country") or h.get("country_code") or ""
+        label = ", ".join(p for p in (name, admin, country) if p)
+        out.append({
+            "label": label, "name": name, "admin1": admin, "country": country,
+            "country_code": h.get("country_code"), "lat": lat, "lon": lon,
+        })
+    return out
+
+
 def resolve_location(cfg):
     if cfg["LAT"] is not None and cfg["LON"] is not None:
         return cfg["LAT"], cfg["LON"], cfg["LOCATION"]

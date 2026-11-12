@@ -132,6 +132,11 @@
             <div class="auto-row"><span>target / eco / floor</span><code id="cfgTemps">—</code></div>
             <div class="auto-row"><span>margin</span><code id="cfgMargin">—</code></div>
             <div class="auto-row"><span>overrides</span><code id="cfgOverrides">none</code></div>
+            <div class="auto-row"><span>location</span><code id="cfgLocation">—</code></div>
+            <div class="auto-row" title="Learned thermal model — UA is the cooling rate measured from real overnight coast-downs">
+              <span>model</span>
+              <span class="m-row"><code id="cfgModel">—</code><span class="model-badge def" id="cfgModelSrc">default</span></span>
+            </div>
           </div>
           <div id="planStrip" class="plan-strip" title="Heater ON blocks (next 24h)"></div>
           <div class="plan-legend">
@@ -191,6 +196,17 @@
         <label class="field">Margin °C
           <input id="setMargin" name="margin" type="number" min="0" max="10" step="0.5">
         </label>
+      </div>
+      <div class="loc-field">
+        <span class="field-label">Location</span>
+        <div class="loc-ctl">
+          <input id="setLocation" name="location" placeholder="e.g. London, UK"
+                 autocomplete="off" spellcheck="false">
+          <button type="button" id="locClear" class="btn ghost small" title="Clear location">✕</button>
+        </div>
+        <ul id="locSuggest" class="loc-dropdown hidden" role="listbox" aria-label="location suggestions"></ul>
+        <p class="hint">Type to search, then pick a suggestion. Selecting one pins its
+          coordinates; you may also type a free-form name to geocode on save.</p>
       </div>
       <p class="hint">Use an end time earlier than the start for an overnight window,
         e.g. <code>22:00-01:00</code>. Start and end may not be equal.</p>

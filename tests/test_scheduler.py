@@ -39,6 +39,23 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg["P_HEAT_KW"], 2.5)
         self.assertEqual(cfg["HORIZON_H"], 24)
 
+    def test_load_config_merges_fitted_model(self):
+        import json, os, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "scheduler.env"), "w") as f:
+                f.write("WINDOW=17:00-23:00\n")
+            with open(os.path.join(d, "scheduler_model.json"), "w") as f:
+                json.dump({"UA_KW_PER_C": 0.0234, "P_HEAT_KW": 2.4}, f)
+            orig = scheduler.BASE_DIR
+            scheduler.BASE_DIR = d
+            try:
+                cfg = scheduler.load_config()
+            finally:
+                scheduler.BASE_DIR = orig
+        self.assertAlmostEqual(cfg["UA_KW_PER_C"], 0.0234)
+        self.assertAlmostEqual(cfg["P_HEAT_KW"], 2.4)
+        self.assertEqual(cfg["WINDOW"], "17:00-23:00")
+
 
 # --- windows -----------------------------------------------------------------
 class TestWindows(unittest.TestCase):
@@ -144,6 +161,27 @@ class TestGeocoding(unittest.TestCase):
         with mock.patch.object(scheduler, "http_get_json", return_value={"results": []}):
             with self.assertRaises(SystemExit):
                 scheduler.resolve_location(cfg)
+
+    def test_geocode_returns_suggestions_deduped(self):
+        api_hits = [
+            {"name": "London", "latitude": 51.5, "longitude": -0.12,
+             "admin1": "England", "country": "United Kingdom", "country_code": "GB"},
+            {"name": "London", "latitude": 51.5, "longitude": -0.12001,
+             "admin1": "England", "country": "United Kingdom", "country_code": "GB"},
+            {"name": "London Ontario", "latitude": 42.98, "longitude": -81.24,
+             "admin1": "Ontario", "country": "Canada", "country_code": "CA"},
+        ]
+        with mock.patch.object(scheduler, "http_get_json",
+                               return_value={"results": api_hits}):
+            out = scheduler.geocode("Lon", 8)
+        self.assertEqual(len(out), 2)      # the two London, UK hits collapse to one
+        self.assertEqual(out[0]["label"], "London, England, United Kingdom")
+        self.assertAlmostEqual(out[0]["lat"], 51.5)
+
+    def test_geocode_requires_two_characters(self):
+        with mock.patch.object(scheduler, "http_get_json") as g:
+            self.assertEqual(scheduler.geocode("L"), [])
+        g.assert_not_called()
 
 
 # --- thermal model -----------------------------------------------------------

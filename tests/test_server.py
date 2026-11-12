@@ -55,6 +55,10 @@ def _scheduler_cfg():
 
 class TestSpaServer(unittest.TestCase):
     def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(setattr, server, "BASE_DIR", server.BASE_DIR)
+        server.BASE_DIR = self.tmp.name
         cfg = mock.MagicMock()
         cfg.mode = "manual"
         cfg.scheduler_cfg = _scheduler_cfg()
@@ -67,6 +71,58 @@ class TestSpaServer(unittest.TestCase):
         self.assertEqual(len(hist), 1)
         self.assertEqual(hist[0]["water"], 39)
         self.assertIsNone(hist[0]["ambient"])
+
+    def test_update_state_persists_shadow_log(self):
+        self.app.update_state(_shadow())
+        path = os.path.join(self.tmp.name, "shadow_log.jsonl")
+        self.assertTrue(os.path.exists(path))
+        with open(path) as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["shadow"]["water_temperature"], 39)
+        # throttled: an immediate second poll does not append
+        self.app.update_state(_shadow())
+        with open(path) as f:
+            self.assertEqual(len([l for l in f if l.strip()]), 1)
+
+    def test_measures_cooling_rate_from_coast_downs(self):
+        base = 1_800_000_000            # aligned to the hour
+        self.app._amb = {base + h * 3600: 5.0 for h in range(8)}
+        self.app.cfg.scheduler_cfg["UA_KW_PER_C"] = 0.02
+        clock = {"now": base}
+        states = [(38.6, 28), (37.2, 28), (35.8, 28)]
+        with mock.patch.object(server.time, "time", lambda: clock["now"]):
+            self.app._maybe_sample_ua({
+                "water_temperature": 40, "temperature_setting": 28,
+                "power_state": 1, "heater_state": 0})       # anchor at +0h
+            for i, (water, setpoint) in enumerate(states, start=1):
+                clock["now"] = base + i * 7200
+                self.app._maybe_sample_ua({
+                    "water_temperature": water, "temperature_setting": setpoint,
+                    "power_state": 1, "heater_state": 0})
+        self.assertEqual(len(self.app._ua_samples), 3)
+        self.assertAlmostEqual(self.app.cfg.scheduler_cfg["UA_KW_PER_C"],
+                               0.0308, delta=0.002)
+        path = os.path.join(self.tmp.name, "scheduler_model.json")
+        with open(path) as f:
+            model = json.load(f)
+        self.assertEqual(model["source"], "online coast-down")
+        self.assertEqual(model["ua_samples"], 3)
+        self.assertAlmostEqual(model["UA_KW_PER_C"], 0.0308, delta=0.002)
+
+    def test_does_not_fit_while_heating(self):
+        base = 1_800_000_000
+        self.app._amb = {base + h * 3600: 5.0 for h in range(8)}
+        clock = {"now": base}
+        with mock.patch.object(server.time, "time", lambda: clock["now"]):
+            self.app._maybe_sample_ua({
+                "water_temperature": 35, "temperature_setting": 40,
+                "power_state": 1, "heater_state": 2})       # heating
+            clock["now"] = base + 7200
+            self.app._maybe_sample_ua({
+                "water_temperature": 37, "temperature_setting": 40,
+                "power_state": 1, "heater_state": 2})
+        self.assertEqual(self.app._ua_samples, [])
 
     def test_history_window_filtering(self):
         now = int(time.time())
@@ -174,6 +230,69 @@ class TestSchedulerConfigUpdate(unittest.TestCase):
             self.app.update_scheduler_config({"target": 20, "eco": 28})
         with self.assertRaises(ValueError):
             self.app.update_scheduler_config({"target": 45})
+
+    def test_update_location_accepts_pinned_coords(self):
+        out = self.app.update_scheduler_config({
+            "location": "Rome, Lazio, Italy", "lat": 41.9, "lon": 12.5})
+        env = self._env()
+        self.assertEqual(env["LOCATION"], "Rome, Lazio, Italy")
+        self.assertAlmostEqual(float(env["LAT"]), 41.9)
+        self.assertAlmostEqual(float(env["LON"]), 12.5)
+        self.assertAlmostEqual(self.app._lat, 41.9)
+        self.assertAlmostEqual(self.app._lon, 12.5)
+        # ambient + coast-down caches dropped after a move
+        self.assertEqual(self.app._amb, {})
+        self.assertIsNone(self.app._ua_prev)
+
+    def test_update_location_geocodes_free_text(self):
+        hit = {"label": "Paris, Île-de-France, France", "name": "Paris",
+               "admin1": "Île-de-France", "country": "France",
+               "country_code": "FR", "lat": 48.85, "lon": 2.35}
+        with mock.patch.object(server.scheduler, "geocode",
+                               return_value=[hit]):
+            out = self.app.update_scheduler_config({"location": "paris"})
+        env = self._env()
+        self.assertEqual(env["LOCATION"], "Paris, Île-de-France, France")
+        self.assertAlmostEqual(float(env["LAT"]), 48.85)
+        self.assertAlmostEqual(float(env["LON"]), 2.35)
+        self.assertAlmostEqual(self.app._lat, 48.85)
+
+    def test_update_location_rejects_unknown(self):
+        with mock.patch.object(server.scheduler, "geocode", return_value=[]):
+            with self.assertRaises(ValueError):
+                self.app.update_scheduler_config({"location": "atlantis-xyz"})
+
+    def test_update_location_rejects_empty(self):
+        with self.assertRaises(ValueError):
+            self.app.update_scheduler_config({"location": "   "})
+
+    def test_model_info_reports_source_and_samples(self):
+        cfg = _scheduler_cfg()
+        with mock.patch.object(server.scheduler, "load_env", return_value={}):
+            pass
+        cfg["UA_KW_PER_C"] = 0.025
+        # no model file -> defaults
+        info = server.scheduler.model_info(cfg)
+        self.assertEqual(info["source"], "default")
+        self.assertEqual(info["samples"], 0)
+        # with a fitted model file
+        with open(os.path.join(self.tmp.name, "scheduler_model.json"), "w") as f:
+            json.dump({"UA_KW_PER_C": 0.025, "ua_samples": 7, "source": "online coast-down",
+                       "saved_at": 123456}, f)
+        info2 = server.scheduler.model_info(cfg)
+        self.assertEqual(info2["ua"], 0.025)
+        self.assertEqual(info2["samples"], 7)
+        self.assertEqual(info2["source"], "online coast-down")
+        self.assertEqual(info2["saved_at"], 123456)
+
+    def test_payload_includes_location_and_model(self):
+        out = self.app.update_scheduler_config({"window": "17:00-23:00"})
+        self.assertIn("location", out)
+        self.assertIn("lat", out)
+        self.assertIn("lon", out)
+        self.assertIn("model", out)
+        self.assertIn("ua", out["model"])
+        self.assertAlmostEqual(out["model"]["ua"], 0.03)
 
     def test_operation_log_keeps_newest(self):
         self.app.add_log("ok", "one")
@@ -314,6 +433,21 @@ class TestAPIEndpoints(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self._get("/api/nope")
         self.assertEqual(ctx.exception.code, 404)
+
+    def test_location_search_endpoint(self):
+        import urllib.request
+        hit = {"label": "London, England, United Kingdom", "name": "London",
+               "admin1": "England", "country": "United Kingdom",
+               "country_code": "GB", "lat": 51.5, "lon": -0.1}
+        with mock.patch.object(server.scheduler, "geocode",
+                               return_value=[hit]) as g:
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/api/location/search?q=Lon" % self.port)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                d = json.loads(r.read())
+        g.assert_called_once_with("Lon", 8)
+        self.assertEqual(d["results"][0]["label"], "London, England, United Kingdom")
+        self.assertAlmostEqual(d["results"][0]["lat"], 51.5)
 
 
 if __name__ == "__main__":

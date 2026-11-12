@@ -25,6 +25,7 @@ const state = {
   config: null,
   log: [],
   range: 24,
+  fcDays: 3,
   tempLocked: false,
 };
 
@@ -307,6 +308,178 @@ function drawChart() {
     ctx.textAlign = "left";
     ctx.fillText(label, tx, ty);
   };
+}
+
+/* ---------------- forecast & heating plan ---------------- */
+function _dayKey(ts) {
+  const d = new Date(ts * 1000);
+  return d.getFullYear() + "-" + d.getMonth() + "-" + d.getDate();
+}
+
+function renderDayCards() {
+  const host = $("#dayCards");
+  host.innerHTML = "";
+  const ser = state.weather || [];
+  if (ser.length < 2) {
+    host.innerHTML = '<p class="hint">Forecast unavailable.</p>';
+    return;
+  }
+  const byDay = new Map();
+  for (const w of ser) {
+    const k = _dayKey(w.ts);
+    if (!byDay.has(k)) byDay.set(k, { ts: w.ts, temps: [] });
+    if (w.temp != null) byDay.get(k).temps.push(w.temp);
+  }
+  // two passes: compute a global lo/hi so every day's bar shares one scale
+  const dayStats = [];
+  let gLo = Infinity, gHi = -Infinity;
+  for (const { ts, temps } of byDay.values()) {
+    if (!temps.length) continue;
+    const lo = Math.min.apply(null, temps);
+    const hi = Math.max.apply(null, temps);
+    dayStats.push({ ts, lo, hi });
+    gLo = Math.min(gLo, lo); gHi = Math.max(gHi, hi);
+  }
+  const range = Math.max(1, gHi - gLo);
+  const DAYS_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const todayKey = _dayKey(Date.now() / 1000);
+  let first = true;
+  for (const { ts, lo, hi } of dayStats) {
+    const d = new Date(ts * 1000);
+    const name = _dayKey(ts) === todayKey ? "Today" : DAYS_SHORT[d.getDay()];
+    const left = Math.max(0, Math.min(100, (lo - gLo) / range * 100));
+    const width = Math.max(8, (hi - lo) / range * 100);
+    const card = document.createElement("div");
+    card.className = "day-card" + (first ? " today" : "");
+    first = false;
+    card.innerHTML =
+      '<span class="day-name">' + name + "</span>" +
+      '<span class="day-date">' + d.getDate() + "/" + (d.getMonth() + 1) + "</span>" +
+      '<span class="day-bar"><i style="left:' + left + "%;width:" + width + '%"></i></span>' +
+      '<span class="day-temp"><b>' + hi.toFixed(0) + '°</b><span class="day-lo">' + lo.toFixed(0) + "°</span></span>";
+    host.appendChild(card);
+  }
+}
+
+function drawForecastChart() {
+  const cv = $("#fcChart");
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (!W || !H) return;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const ctx = cv.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  const pad = { l: 46, r: 14, t: 16, b: 26 };
+  const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+  const weather = state.weather || [];
+  const plan = state.plan;
+  if (!weather.length || !plan || !plan.plan_ts) {
+    ctx.fillStyle = "#8b97b5";
+    ctx.font = "13px sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("planning…", W / 2, H / 2);
+    return;
+  }
+  const t0 = weather[0].ts;
+  const t1 = weather[weather.length - 1].ts;
+  const span = Math.max(1, t1 - t0);
+  const all = weather.filter((w) => w.temp != null).map((w) => w.temp)
+    .concat(plan.plan_water || []).concat(plan.plan_amb || []);
+  let lo = Math.floor(Math.min.apply(null, all) - 2);
+  let hi = Math.ceil(Math.max.apply(null, all) + 2);
+  lo = Math.max(-20, lo); hi = Math.min(45, hi);
+
+  const X = (ts) => pad.l + iw * (ts - t0) / span;
+  const Y = (t) => pad.t + ih * (1 - (t - lo) / (hi - lo));
+  const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+  // grid
+  ctx.strokeStyle = "rgba(255,255,255,0.06)";
+  ctx.fillStyle = "#8b97b5";
+  ctx.font = "11px sans-serif";
+  ctx.textAlign = "right";
+  for (let t = lo; t <= hi; t += Math.max(1, Math.round((hi - lo) / 5))) {
+    ctx.beginPath(); ctx.moveTo(pad.l, Y(t)); ctx.lineTo(W - pad.r, Y(t)); ctx.stroke();
+    ctx.fillText(t + "°", pad.l - 6, Y(t) + 4);
+  }
+  // time grid + day separators
+  ctx.textAlign = "center";
+  for (let ts = t0 - (t0 % 86400) - 86400; ts <= t1 + 86400; ts += 86400) {
+    if (ts <= t0 || ts > t1) continue;
+    ctx.strokeStyle = "rgba(255,255,255,0.18)";
+    ctx.beginPath(); ctx.moveTo(X(ts), pad.t); ctx.lineTo(X(ts), pad.t + ih); ctx.stroke();
+    const d = new Date(ts * 1000);
+    ctx.fillStyle = "#aab6d4";
+    ctx.fillText(DAY_NAMES[d.getDay()] + " " + d.getDate(), X(ts), H - 8);
+  }
+
+  const plan_ts = plan.plan_ts;
+  const plan_phase = plan.plan_phase || [];
+  const plan_us = plan.plan_us || [];
+  const plan_set = plan.plan_set || [];
+  const plan_water = plan.plan_water || [];
+
+  // window / preheat shading
+  plan_phase.forEach((p, i) => {
+    if (p === "eco") return;
+    const x0 = X(plan_ts[i]), x1 = X(plan_ts[i] + 3600);
+    ctx.fillStyle = p === "window" ? "rgba(124,92,255,0.16)" : "rgba(255,184,107,0.10)";
+    ctx.fillRect(x0, pad.t, Math.max(1, x1 - x0), ih);
+  });
+
+  // target/eco reference lines
+  if (plan_set.length) {
+    const tgt = plan_set[0];
+    ctx.strokeStyle = "rgba(124,92,255,0.8)";
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(pad.l, Y(tgt)); ctx.lineTo(W - pad.r, Y(tgt)); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // heater-on bands
+  if (plan_us.length) {
+    ctx.fillStyle = "rgba(255,107,107,0.14)";
+    for (let i = 0; i < plan_us.length; i++) {
+      if (!plan_us[i]) continue;
+      const x0 = X(plan_ts[i]), x1 = X(plan_ts[i] + 3600);
+      ctx.fillRect(x0, pad.t, Math.max(1, x1 - x0), ih);
+    }
+  }
+
+  // ambient forecast line (full span)
+  const ambPts = weather.filter((w) => w.temp != null);
+  if (ambPts.length > 1) {
+    ctx.strokeStyle = "#ffb86b";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ambPts.forEach((p, i) => (i ? ctx.lineTo(X(p.ts), Y(p.temp)) : ctx.moveTo(X(p.ts), Y(p.temp))));
+    ctx.stroke();
+  }
+
+  // projected water line (plan horizon)
+  if (plan_water.length && plan_water.length >= plan_ts.length) {
+    ctx.strokeStyle = "#4fd1ff";
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    plan_water.forEach((v, i) => (i ? ctx.lineTo(X(plan_ts[i]), Y(v)) : ctx.moveTo(X(plan_ts[i]), Y(v))));
+    ctx.stroke();
+  }
+}
+
+function renderForecast() {
+  renderDayCards();
+  drawForecastChart();
+}
+
+function setFcDays(days) {
+  state.fcDays = days;
+  $$("#fcPills .pill-btn").forEach((b) => {
+    b.classList.toggle("active", Number(b.dataset.fcDays) === days);
+  });
+  loadWeather().then(renderForecast);
 }
 
 /* ---------------- controls ---------------- */
@@ -664,14 +837,16 @@ async function loadPlan() {
     state.plan = await api("/api/plan");
     renderPlanStrip();
     refreshFacts();
+    renderForecast();
   } catch (e) { /* plan unavailable offline */ }
 }
 
 async function loadWeather() {
   try {
-    const d = await api("/api/weather");
+    const d = await api("/api/weather?days=" + state.fcDays);
     state.weather = d.series || [];
     refreshFacts();
+    renderForecast();
   } catch (e) { /* ignore */ }
 }
 
@@ -759,8 +934,14 @@ function bindEvents() {
     } catch (e) { toast(e.message, "err"); }
   });
 
+  $("#settingsBtn").addEventListener("click", openSettings);
+  $("#settingsCancel").addEventListener("click", closeSettings);
+  $("#settingsForm").addEventListener("submit", saveSettings);
   bindSettings();
   $("#opClose").addEventListener("click", closeOpModal);
+  $$("#fcPills .pill-btn").forEach((b) => {
+    b.addEventListener("click", () => setFcDays(Number(b.dataset.fcDays)));
+  });
   $("#settingsModal").addEventListener("click", (e) => {
     if (e.target.id === "settingsModal") closeSettings();
   });
@@ -801,7 +982,7 @@ function bindEvents() {
     loadHistory();
   });
 
-  window.addEventListener("resize", () => drawChart());
+  window.addEventListener("resize", () => { drawChart(); renderForecast(); });
 }
 
 /* ---------------- SSE ---------------- */

@@ -250,4 +250,4 @@ Our small contribution here: documenting the `app-api.lay-z-spa.co.uk` route map
 
 ## 🔒 License
 
-[Apache License 2.0](LICENSE) — © 2026 James Catnegie. See [`LICENSE`](LICENSE).
+[Apache License 2.0](LICENSE) — © 2026 kipz. See [`LICENSE`](LICENSE).

@@ -422,6 +422,58 @@ class TestSchedulerStep(unittest.TestCase):
         calls = [c[0] for c in mock_spa.send_command.call_args_list]
         self.assertIn(("power_state", 1), [(dp, v) for _, dp, v in calls])
 
+    def test_step_returns_schedule_projection(self):
+        cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28)
+        mock_spa = mock.MagicMock()
+        mock_spa.shadow.return_value = {
+            "water_temperature": 40, "power_state": 1,
+            "temperature_setting": 40, "heater_state": 6, "filter_state": 2}
+        with mock.patch.dict(sys.modules, {"spa": mock_spa}), \
+             mock.patch.object(scheduler, "fetch_forecast",
+                               return_value=self._mock_weather()):
+            res = scheduler.scheduler_step(cfg, 51.5, -0.12, apply=False)
+        n = len(res["plan_ts"])
+        self.assertEqual(len(res["plan_water"]), n)
+        self.assertEqual(len(res["plan_set"]), n)
+        self.assertEqual(len(res["plan_phase"]), n)
+        self.assertTrue(all(-5 <= v <= 40.5 for v in res["plan_water"]))
+        self.assertTrue(set(res["plan_set"]) <= {28, 40})
+        self.assertTrue(set(res["plan_phase"]) <= {"window", "preheat", "eco"})
+        # window hours (17:00-23:00 Monday) are set to target
+        for i, ts in enumerate(res["plan_ts"]):
+            hm = dt.datetime.fromtimestamp(ts)
+            if 17 <= hm.hour < 23:
+                self.assertEqual(res["plan_set"][i], 40, ts)
+                self.assertEqual(res["plan_phase"][i], "window")
+
+
+class TestPhaseSeries(unittest.TestCase):
+    def test_classifies_window_preheat_eco(self):
+        series = make_series(0)                 # 48 h from Monday 00:00 UTC
+        cfg = make_cfg(WINDOW="17:00-23:00")
+        windows = scheduler.windows_from_config(cfg)
+        us = [0] * len(series)
+        for i in range(14, 23):                  # heat 14:00..22:59
+            us[i] = 1
+        phases = scheduler.phase_series(series, us, windows)
+        self.assertEqual(phases[13], "eco")
+        for i in range(14, 17):
+            self.assertEqual(phases[i], "preheat", i)
+        for i in range(17, 23):
+            self.assertEqual(phases[i], "window", i)
+        self.assertEqual(phases[23], "eco")
+
+    def test_broken_preheat_is_eco(self):
+        series = make_series(0)
+        cfg = make_cfg(WINDOW="17:00-23:00")
+        windows = scheduler.windows_from_config(cfg)
+        us = [0] * len(series)
+        for i in range(14, 16):                  # heat 14:00..15:59, then off
+            us[i] = 1
+        phases = scheduler.phase_series(series, us, windows)
+        for i in range(14, 17):
+            self.assertEqual(phases[i], "eco")  # heater stops before the window
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -94,6 +94,28 @@
         </div>
       </section>
 
+      <!-- ======= Forecast & heating plan ======= -->
+      <section class="chart-card glass" id="forecastCard">
+        <div class="chart-head">
+          <h2>🌤 Forecast &amp; heating plan</h2>
+          <div class="range-pills" id="fcPills">
+            <button class="pill-btn active" data-fc-days="3">3d</button>
+            <button class="pill-btn" data-fc-days="7">7d</button>
+          </div>
+        </div>
+        <div id="dayCards" class="day-cards" aria-label="daily forecast summary"></div>
+        <canvas id="fcChart"></canvas>
+        <div class="legend">
+          <span class="lg"><i class="sw fc-amb"></i>ambient forecast</span>
+          <span class="lg"><i class="sw fc-water"></i>projected water</span>
+          <span class="lg"><i class="sw on"></i>heater ON</span>
+          <span class="lg"><i class="sw fc-window"></i>use window</span>
+          <span class="lg"><i class="sw fc-preheat"></i>preheat</span>
+        </div>
+        <p class="hint" id="fcHint">Projection uses the learned cooling rate (UA)
+          and today's water temperature — cold snaps pull the preheat earlier.</p>
+      </section>
+
       <!-- ======= Controls ======= -->
       <section class="grid">
         <div class="panel glass" id="controlsPanel">

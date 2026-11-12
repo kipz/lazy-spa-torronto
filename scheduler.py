@@ -519,6 +519,25 @@ def hot_phase_now(series, us, windows):
     return "eco"
 
 
+def phase_series(series, us, windows):
+    """Classify every plan hour: window / preheat / eco (see hot_phase_now)."""
+    n = len(series)
+    phases = []
+    for i in range(n):
+        if in_window(series[i][0], windows):
+            phases.append("window")
+            continue
+        j = next((k for k in range(i, n) if in_window(series[k][0], windows)), None)
+        if j is None:
+            phases.append("eco")
+            continue
+        if us[i] == 1 and all(us[k] == 1 for k in range(i, j)):
+            phases.append("preheat")
+        else:
+            phases.append("eco")
+    return phases
+
+
 def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True):
     """Run one hourly scheduler step: fetch weather -> replan -> (optionally) apply.
 
@@ -539,6 +558,11 @@ def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True):
     us, energy, _ = optimal_start(cfg, series, T0, windows)
     phase = hot_phase_now(series, us, windows)
     setting = int(cfg["TARGET_TEMP"]) if phase in ("window", "preheat") else int(cfg["ECO_TEMP"])
+    # Projected water trace + per-hour setpoint/phase for the UI forecast.
+    temps, _, _ = simulate(cfg, series, T0, windows, u_schedule=us)
+    phases = phase_series(series, us, windows)
+    target = float(cfg["TARGET_TEMP"]) + float(cfg["MARGIN"])
+    eco = float(cfg["ECO_TEMP"])
     changed = False
     if apply:
         if int(state.get("power_state") or 0) != 1:
@@ -561,6 +585,9 @@ def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True):
         "plan_ts": [s[0] for s in series],
         "plan_amb": [s[1] for s in series],
         "plan_us": us,
+        "plan_water": [round(t, 2) for t in temps[:-1]],
+        "plan_set": [target if p != "eco" else eco for p in phases],
+        "plan_phase": phases,
         "energy_kwh": energy,
         "changed": changed,
         "series_start": series[0][0],

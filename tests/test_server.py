@@ -302,6 +302,28 @@ class TestSchedulerConfigUpdate(unittest.TestCase):
         self.assertEqual(entries[-1]["msg"], "two")
         self.assertEqual(entries[-1]["level"], "err")
 
+    def test_operation_log_persists_across_restart(self):
+        self.app.add_log("ok", "first boot worked fine")
+        path = os.path.join(self.tmp.name, "operation_log.jsonl")
+        self.assertTrue(os.path.exists(path))
+        # simulate a server restart: a brand-new SpaServer over the same dir
+        cfg = mock.MagicMock()
+        cfg.mode = "manual"
+        cfg.scheduler_cfg = _scheduler_cfg()
+        with mock.patch.object(server.scheduler, "load_env", return_value={}):
+            app2 = server.SpaServer(cfg)
+        entries = app2.get_log(200)
+        msgs = [e["msg"] for e in entries]
+        self.assertTrue(any("first boot worked fine" in m for m in msgs),
+                        "history lost after restart: %s" % msgs)
+
+    def test_log_endpoint_survives_restart_via_file(self):
+        # the durable file is what /api/log reads; poll the file directly
+        path = os.path.join(self.tmp.name, "operation_log.jsonl")
+        self.app.add_log("warn", "unexpected temperature spike")
+        with open(path) as f:
+            raw = f.read()
+        self.assertIn("unexpected temperature spike", raw)
 
 class TestAPIEndpoints(unittest.TestCase):
     """Spin a real ThreadingHTTPServer with a mocked SpaServer and hit it."""
@@ -448,6 +470,22 @@ class TestAPIEndpoints(unittest.TestCase):
         g.assert_called_once_with("Lon", 8)
         self.assertEqual(d["results"][0]["label"], "London, England, United Kingdom")
         self.assertAlmostEqual(d["results"][0]["lat"], 51.5)
+
+    def test_weather_endpoint_multi_day(self):
+        import urllib.request
+        hour0 = int(time.time()) - (int(time.time()) % 3600)
+        payload = {}
+        for i in range(7 * 24):
+            payload[hour0 + i * 3600] = (4.0 + (i % 6), 1.0, 0.0)
+        with mock.patch.object(server.scheduler, "fetch_forecast",
+                               return_value=payload):
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/api/weather?days=7" % self.port)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                d = json.loads(r.read())
+        self.assertEqual(d["days"], 7)
+        self.assertGreaterEqual(len(d["series"]), 7 * 24 - 1)
+        self.assertEqual(d["series"][0]["temp"], 4.0)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,8 @@ POLL_SECONDS = 15.0
 HISTORY_SECONDS = 7 * 86400        # keep ~1 week of history in memory
 SHADOW_LOG_SECONDS = 300           # append one shadow snapshot to JSONL per 5 min
 LOG_MAX = 300                      # operation log entries kept in memory
+OPERATION_LOG_FILE = "operation_log.jsonl"   # durable operation log (gitignored)
+LOG_FILE_MAX = 3000                # prune the durable log to this many entries
 # Online cooling-rate (UA) estimate from real heater-off coast-downs. Spans
 # are long enough to rise above the spa's 1 C temperature resolution.
 UA_MIN_SAMPLES = 3                 # samples needed before the model is updated
@@ -310,8 +312,19 @@ class SpaServer:
             self.add_log("err", "Could not save thermal model: %s" % e)
 
     # -- operation log -----------------------------------------------------
+    def _log_path(self):
+        return os.path.join(BASE_DIR, OPERATION_LOG_FILE)
+
     def add_log(self, level, msg):
         entry = {"ts": int(time.time()), "level": level, "msg": str(msg)}
+        # durable: append to the JSONL log so history survives restarts
+        path = self._log_path()
+        try:
+            with open(path, "a") as f:
+                f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        except OSError:
+            pass
+        self._prune_log_file()
         with self._log_lock:
             self._log.append(entry)
             if len(self._log) > LOG_MAX:
@@ -319,9 +332,43 @@ class SpaServer:
         self._broadcast("log")
         return entry
 
+    def _prune_log_file(self):
+        """Keep the durable log bounded so it can't grow forever."""
+        try:
+            if os.path.getsize(self._log_path()) < 1 << 20:   # < 1 MB
+                return
+            with open(self._log_path()) as f:
+                lines = [ln for ln in f if ln.strip()]
+            if len(lines) <= LOG_FILE_MAX:
+                return
+            with open(self._log_path(), "w") as f:
+                for ln in lines[-LOG_FILE_MAX:]:
+                    f.write(ln)
+        except OSError:
+            pass
+
     def get_log(self, limit=100):
-        with self._log_lock:
-            return [dict(e) for e in self._log[-int(limit):]]
+        """Return the most recent `limit` entries from the durable log."""
+        limit = int(limit)
+        path = self._log_path()
+        entries = []
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entries.append(json.loads(line))
+                        except ValueError:
+                            pass
+            except OSError:
+                entries = []
+        if not entries:  # fall back to the in-memory cache
+            with self._log_lock:
+                return [dict(e) for e in self._log[-limit:]]
+        return [dict(e) for e in entries[-limit:]]
 
     # -- SSE --------------------------------------------------------------
     def _broadcast(self, kind):
@@ -598,7 +645,7 @@ class _Handler(BaseHTTPRequestHandler):
                 limit = int(qs.get("limit", ["100"])[0])
             except ValueError:
                 limit = 100
-            self._send_json(200, {"entries": app.get_log(max(1, min(limit, LOG_MAX)))})
+            self._send_json(200, {"entries": app.get_log(max(1, min(limit, LOG_FILE_MAX)))})
         elif path == "/api/location/search":
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             query = (qs.get("q") or [""])[0]
@@ -607,18 +654,25 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(502, {"error": "location search failed: %s" % e})
         elif path == "/api/weather":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:
-                weather = scheduler.fetch_forecast(app._lat, app._lon, forecast_days=2)
+                days = int(qs.get("days", ["3"])[0])
+            except ValueError:
+                days = 3
+            days = max(1, min(days, 7))
+            try:
+                weather = scheduler.fetch_forecast(app._lat, app._lon,
+                                                   forecast_days=days)
                 now = int(time.time())
                 hour = now - (now % 3600)
                 series = []
-                for _ in range(24):
+                for _ in range(days * 24):
                     entry = weather.get(hour)
                     if entry is None:
                         break
                     series.append({"ts": hour, "temp": entry[0]})
                     hour += 3600
-                self._send_json(200, {"series": series})
+                self._send_json(200, {"series": series, "days": days})
             except Exception as e:
                 self._send_json(502, {"error": str(e)})
 

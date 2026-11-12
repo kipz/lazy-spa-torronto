@@ -22,7 +22,8 @@ Open `http://<host>:8080/` in a browser.
 | **Auto-heating** | Manual ⇄ Auto mode switch, live phase (eco/preheat/window), 24 h heater-on plan strip, replan button, config summary incl. location and learned model |
 | **Settings** | Edit the default/per-day use windows, target/eco/floor temperatures, margin, and location (type-ahead + validation) from the UI |
 | **Feedback** | Command progress modal (sent → confirmed by status), AUTO lock hints, and a live operation log |
-| **Weather** | Next-24 h forecast strip + ambient in chart/facts |
+| **Forecast** | Multi-day (3d/7d) ambient forecast cards + a plan chart overlaying projected water temperature, heater-on blocks and window/preheat shading on the weather timeline |
+| **Weather** | Next-24 h forecast fact + ambient in chart/facts |
 
 ## Modes
 
@@ -52,14 +53,14 @@ Switching to Auto while mid-preheat asks for confirmation.
 |---|---|---|
 | GET | `/api/state` | Live shadow + mode + phase + setting |
 | GET | `/api/history?range=24` | Water/target/heater/ambient series (hours) |
-| GET | `/api/plan` | 48 h optimal-start heater plan + energy |
+| GET | `/api/plan` | 48 h optimal-start heater plan + energy + projected water/setpoint/phase per hour |
 | GET | `/api/scheduler` | Mode, windows, per-day overrides, target/eco/floor/margin, location + lat/lon, measured model (`ua`, `p`, samples, source) |
 | POST | `/api/scheduler` | `{"mode":"auto"\|"manual"}`, `{"replan":true}`, or `{"config":{...}}` |
-| GET | `/api/weather` | Next-24 h forecast |
+| GET | `/api/weather?days=3` | Hourly forecast for 1–7 days (`days` defaults to 3) |
 | GET | `/api/location/search?q=...` | Geocoding type-ahead suggestions for the location editor |
 | POST | `/api/cmd` | `{"datapoint","value"}` — clamped 20–40, temp rejected in auto |
 | GET | `/api/health` | Connectivity, last update age |
-| GET | `/api/log?limit=100` | Recent server-side operations |
+| GET | `/api/log?limit=100` | Recent server-side operations (persistent, up to 3000 entries) |
 | GET | `/api/events` | SSE live push (state/plan/mode/config/log) |
 
 A config update looks like:
@@ -91,6 +92,19 @@ The `/api/scheduler` payload carries the full current state, including the
 `model` object: the `UA` cooling rate and `P` heater power currently in use,
 the number of `ua_samples`, the `source` (`default`, `calibrated`, or
 `online coast-down`) and when it was last saved.
+
+The plan payload carries a per-hour **schedule projection** used by the
+forecast chart: `plan_water` (projected water temperature), `plan_set`
+(setpoint the scheduler would apply) and `plan_phase` (`window` / `preheat` /
+`eco`) aligned with `plan_ts`. Together with `plan_amb` and `plan_us` this
+renders how the coming days' weather drives heating.
+
+## Operation log persistence
+
+The operation log is durable: every entry is appended to
+`operation_log.jsonl` (gitignored) and the `/api/log` endpoint reads from that
+file, so history survives server restarts (capped at 3000 entries, pruned in
+place). Restarting the service no longer wipes the log.
 
 Command datapoints: `power_state`, `heater_state`, `filter_state`,
 `wave_state`, `hydrojet_state`, `locked`, `temperature_setting` (aliases

@@ -60,6 +60,33 @@ class TestWindows(unittest.TestCase):
         self.assertFalse(scheduler.in_window(ts_at(16, 59), days))
         self.assertFalse(scheduler.in_window(ts_at(12, 0), days))  # Tuesday
 
+    def test_in_window_overnight(self):
+        # Monday 22:00 -> Tuesday 01:00
+        days = {0: [((22, 0), (1, 0))]}
+        self.assertFalse(scheduler.in_window(ts_at(21, 59), days))
+        self.assertTrue(scheduler.in_window(ts_at(22, 0), days))
+        self.assertTrue(scheduler.in_window(ts_at(23, 59), days))
+        self.assertTrue(scheduler.in_window(ts_at(0, 0, day_offset=1), days))
+        self.assertTrue(scheduler.in_window(ts_at(0, 59, day_offset=1), days))
+        self.assertFalse(scheduler.in_window(ts_at(1, 0, day_offset=1), days))  # exclusive
+        self.assertFalse(scheduler.in_window(ts_at(2, 0, day_offset=1), days))
+        # Tuesday evening is not part of Monday's window (Tuesday has no window)
+        self.assertFalse(scheduler.in_window(ts_at(22, 0, day_offset=1), days))
+
+    def test_in_window_overnight_respects_per_day_source(self):
+        # Saturday 22:00 -> Sunday 01:00; Sunday has its own 17:00-23:00 window.
+        days = {5: [((22, 0), (1, 0))], 6: [((17, 0), (23, 0))]}
+        self.assertTrue(scheduler.in_window(ts_at(23, 0, day_offset=5), days))
+        self.assertTrue(scheduler.in_window(ts_at(0, 30, day_offset=6), days))
+        self.assertFalse(scheduler.in_window(ts_at(1, 30, day_offset=6), days))
+        self.assertTrue(scheduler.in_window(ts_at(18, 0, day_offset=6), days))
+
+    def test_in_window_ending_at_midnight(self):
+        days = {0: [((17, 0), (0, 0))]}
+        self.assertTrue(scheduler.in_window(ts_at(17, 0), days))
+        self.assertTrue(scheduler.in_window(ts_at(23, 59), days))
+        self.assertFalse(scheduler.in_window(ts_at(0, 0, day_offset=1), days))
+
 
 # --- weather -----------------------------------------------------------------
 class TestWeather(unittest.TestCase):

@@ -412,7 +412,8 @@ function windowError(spec, label) {
   if (!m) return label + " must use HH:MM-HH:MM";
   const sh = Number(m[1]), sm = Number(m[2]), eh = Number(m[3]), em = Number(m[4]);
   if (sh > 23 || eh > 23 || sm > 59 || em > 59) return label + " must be between 00:00 and 23:59";
-  if (eh * 60 + em <= sh * 60 + sm) return label + " must end after it starts (overnight windows are not supported)";
+  if (eh * 60 + em === sh * 60 + sm) return label + " start and end must differ";
+  // end < start is valid: it crosses midnight, e.g. 22:00-01:00.
   return null;
 }
 

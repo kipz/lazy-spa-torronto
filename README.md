@@ -102,7 +102,7 @@ flowchart LR
 | Key | Default | Meaning |
 |---|---|---|
 | `LOCATION` | `London, UK` | City/postcode (geocoded) or `LAT`/`LON` |
-| `WINDOW` | `17:00-23:00` | Use window; per-day overrides `WINDOW_SAT`… |
+| `WINDOW` | `17:00-23:00` | Use window; per-day overrides `WINDOW_SAT`… An end earlier than the start crosses midnight (e.g. `22:00-01:00`). |
 | `TARGET_TEMP` | `40` | Setpoint during windows (device clamp: 40) |
 | `ECO_TEMP` | `28` | Comfort floor while unused |
 | `FLOOR_TEMP` | `8` | Hard floor (freeze protection) |

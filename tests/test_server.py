@@ -158,11 +158,18 @@ class TestSchedulerConfigUpdate(unittest.TestCase):
         self.assertNotIn("WINDOW_SUN", env)
         self.app.refresh_plan.assert_called_once_with(apply=False)
 
+    def test_accepts_overnight_window(self):
+        out = self.app.update_scheduler_config({"window": "23:00-17:00"})
+        self.assertEqual(out["windows"], "23:00-17:00")
+        self.assertEqual(self._env()["WINDOW"], "23:00-17:00")
+        out = self.app.update_scheduler_config({"window": "17:00-00:00"})
+        self.assertEqual(out["windows"], "17:00-00:00")
+
     def test_rejects_bad_window_and_temp_order(self):
         with self.assertRaises(ValueError):
-            self.app.update_scheduler_config({"window": "23:00-17:00"})
-        with self.assertRaises(ValueError):
             self.app.update_scheduler_config({"window": "nonsense"})
+        with self.assertRaises(ValueError):
+            self.app.update_scheduler_config({"window": "00:00-00:00"})
         with self.assertRaises(ValueError):
             self.app.update_scheduler_config({"target": 20, "eco": 28})
         with self.assertRaises(ValueError):

@@ -72,7 +72,9 @@ A config update looks like:
 ```
 
 It is validated (HH:MM windows, `floor ≤ eco ≤ target`, device temp clamp),
-saved to `scheduler.env`, and immediately replanned.
+saved to `scheduler.env`, and immediately replanned. A window whose end is
+earlier than its start is an overnight window: `22:00-01:00` runs from 22:00
+on its configured day until 01:00 the next morning. Start and end must differ.
 
 Command datapoints: `power_state`, `heater_state`, `filter_state`,
 `wave_state`, `hydrojet_state`, `locked`, `temperature_setting` (aliases

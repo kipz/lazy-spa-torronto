@@ -190,12 +190,26 @@ def windows_from_config(cfg):
 def in_window(ts, windows):
     """ts is epoch seconds; decide using local wall clock.
 
-    A missing weekday key means "no window that day" (returns False).
+    A window whose end is earlier than its start crosses midnight, e.g.
+    ``22:00-01:00`` runs from 22:00 on its configured day until 01:00 the
+    next day. The morning tail therefore belongs to the *previous* weekday's
+    window. A missing weekday key means "no window that day".
     """
     local = dt.datetime.fromtimestamp(ts)
     hm = (local.hour, local.minute)
+
+    # Windows starting today: same-day, or the evening part of an overnight one.
     for s, e in windows.get(local.weekday(), []):
-        if s <= hm < e:
+        if s < e:
+            if s <= hm < e:
+                return True
+        elif hm >= s:                 # crosses midnight, evening portion
+            return True
+
+    # Morning tail of an overnight window that started yesterday.
+    prev = (local.weekday() - 1) % 7
+    for s, e in windows.get(prev, []):
+        if s > e and hm < e:
             return True
     return False
 

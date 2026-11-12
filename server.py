@@ -54,8 +54,9 @@ def validate_window(spec):
     sh, sm, eh, em = (int(x) for x in m.groups())
     if sh > 23 or eh > 23 or sm > 59 or em > 59:
         raise ValueError("window times must be 00:00-23:59")
-    if eh * 60 + em <= sh * 60 + sm:
-        raise ValueError("window end must be after start (overnight windows are not supported)")
+    if eh * 60 + em == sh * 60 + sm:
+        raise ValueError("window start and end must differ")
+    # An end earlier than the start is a valid overnight window.
     return "%02d:%02d-%02d:%02d" % (sh, sm, eh, em)
 
 

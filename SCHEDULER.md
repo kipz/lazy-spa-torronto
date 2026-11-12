@@ -59,6 +59,8 @@ heater MPC research (Stanford S3L, Buechler 2025) and smart-thermostat
 Energy cost = Σ P_heat · u · Δt over the horizon (kWh).
 
 ### Policy invariants
+- Use windows are `HH:MM-HH:MM`. An end earlier than the start crosses
+  midnight (`22:00-01:00` covers 22:00–23:59 and 00:00–00:59 the next day).
 - `T ≥ TARGET_TEMP` from the start of every use window (plus `MARGIN` for the
   compartment-sensor vs bulk-water offset)
 - `T ≥ ECO_TEMP` while unused (comfort floor; also keeps reheat feasible —

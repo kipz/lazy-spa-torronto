@@ -235,6 +235,19 @@ class TestOptimalStart(unittest.TestCase):
         temps, _, _ = scheduler.simulate(cfg, series, T0, windows=days, u_schedule=us)
         self.assertLessEqual(max(temps), 40.0 + 1e-6)
 
+    def test_holds_target_in_final_hour_before_window(self):
+        # Tub is already at the 40C clamp one hour before the window. The
+        # model must keep the heater on to hold target instead of coasting
+        # and arriving below it when the window opens.
+        cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28, UA_KW_PER_C=0.03)
+        days = {0: [((17, 0), (23, 0))]}
+        series = make_series(16, hours=2, t_amb=6.0)  # 16:00-17:00, 17:00-18:00
+        us, _, _ = scheduler.optimal_start(cfg, series, 40.0, windows=days)
+        temps, _, _ = scheduler.simulate(cfg, series, 40.0, windows=days,
+                                         u_schedule=us)
+        self.assertEqual(us[0], 1)                       # 16:00-17:00 heater ON
+        self.assertGreaterEqual(temps[1], 40.0 - 0.01)   # 40C when window opens
+
     def test_coasts_when_above_eco_and_no_window(self):
         cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28)
         series = make_series(0, hours=24, t_amb=20.0)

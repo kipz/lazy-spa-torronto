@@ -302,7 +302,10 @@ def optimal_start(cfg, series, T0, windows):
         req[i] = max(local, min(need_off, need_on))
         req[i] = min(req[i], clamp)
 
-    # forward sweep: hold during windows; heat when coasting would violate req
+    # forward sweep: hold during windows; heat when coasting would violate req.
+    # Heating is also required when the tub is already at the clamp and a
+    # future requirement is at the clamp: the water still loses heat, so
+    # skipping that hour would let it drift below target before the window.
     T = T0
     us = []
     for i in range(n):
@@ -313,7 +316,7 @@ def optimal_start(cfg, series, T0, windows):
             T = T + step / C * (P - ua * (T - t_amb))
         else:
             T_coast = T + step / C * (-ua * (T - t_amb))
-            if T_coast < req[i + 1] - EPS and T < clamp - EPS:
+            if T_coast < req[i + 1] - EPS:
                 us.append(1)
                 T = T + step / C * (P - ua * (T - t_amb))
             else:

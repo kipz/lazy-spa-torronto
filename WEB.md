@@ -20,6 +20,8 @@ Open `http://<host>:8080/` in a browser.
 | **Chart** | Water temp vs ambient vs target over 6h/24h/3d/7d; hover tooltip; heater-on bands |
 | **Controls** | Power, heat, filter, bubbles, jet, lock toggles; 20–40 °C target slider |
 | **Auto-heating** | Manual ⇄ Auto mode switch, live phase (eco/preheat/window), 24 h heater-on plan strip, replan button, config summary |
+| **Settings** | Edit the default/per-day use windows, target/eco/floor temperatures and margin from the UI |
+| **Feedback** | Command progress modal (sent → confirmed by status), AUTO lock hints, and a live operation log |
 | **Weather** | Next-24 h forecast strip + ambient in chart/facts |
 
 ## Modes
@@ -31,6 +33,19 @@ Open `http://<host>:8080/` in a browser.
 
 Switching to Auto while mid-preheat asks for confirmation.
 
+## Feedback & the operation log
+
+- **Manual commands** open a progress modal. It stays up while the cloud
+  accepts the write, then waits for the next shadow poll to show the new value
+  (switch read-backs use truthiness, so `filter_state=2`/`heater_state=4..8`
+  count as ON). Success auto-closes; failures explain what happened.
+- **AUTO mode** shows a lock banner and disables the scheduler-owned controls
+  (power, heat, filter, target temp). Bubbles, jet and lock remain manual.
+- **Operations** in the right-hand sidebar is fed by the server's in-memory
+  log, so it records commands, confirmations, mode changes, settings edits,
+  replans and poll failures. It updates over SSE and survives page reloads for
+  the lifetime of the server process.
+
 ## API
 
 | Method | Path | Purpose |
@@ -38,12 +53,26 @@ Switching to Auto while mid-preheat asks for confirmation.
 | GET | `/api/state` | Live shadow + mode + phase + setting |
 | GET | `/api/history?range=24` | Water/target/heater/ambient series (hours) |
 | GET | `/api/plan` | 48 h optimal-start heater plan + energy |
-| GET | `/api/scheduler` | Mode, windows, target/eco/floor/margin |
-| POST | `/api/scheduler` | `{"mode":"auto"\|"manual"}` or `{"replan":true}` |
+| GET | `/api/scheduler` | Mode, windows, per-day overrides, target/eco/floor/margin |
+| POST | `/api/scheduler` | `{"mode":"auto"\|"manual"}`, `{"replan":true}`, or `{"config":{...}}` |
 | GET | `/api/weather` | Next-24 h forecast |
 | POST | `/api/cmd` | `{"datapoint","value"}` — clamped 20–40, temp rejected in auto |
 | GET | `/api/health` | Connectivity, last update age |
-| GET | `/api/events` | SSE live push (state/plan/mode) |
+| GET | `/api/log?limit=100` | Recent server-side operations |
+| GET | `/api/events` | SSE live push (state/plan/mode/config/log) |
+
+A config update looks like:
+
+```json
+{"config": {
+  "window": "17:00-23:00",
+  "target": 40, "eco": 28, "floor": 8, "margin": 0,
+  "overrides": {"SAT": "14:00-23:00", "SUN": ""}
+}}
+```
+
+It is validated (HH:MM windows, `floor ≤ eco ≤ target`, device temp clamp),
+saved to `scheduler.env`, and immediately replanned.
 
 Command datapoints: `power_state`, `heater_state`, `filter_state`,
 `wave_state`, `hydrojet_state`, `locked`, `temperature_setting` (aliases

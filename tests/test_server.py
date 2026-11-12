@@ -3,7 +3,9 @@
 The spa cloud and weather APIs are mocked; no network and no real device.
 """
 import json
+import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -114,6 +116,67 @@ class TestSpaServer(unittest.TestCase):
             self.assertEqual(args[1], "heater_state")
 
 
+class TestSchedulerConfigUpdate(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        with open(os.path.join(self.tmp.name, "scheduler.env"), "w") as f:
+            f.write("LOCATION=London, UK\nWINDOW=17:00-23:00\n"
+                    "TARGET_TEMP=40\nECO_TEMP=28\nFLOOR_TEMP=8\n")
+        self.orig_server_base = server.BASE_DIR
+        self.orig_sched_base = server.scheduler.BASE_DIR
+        server.BASE_DIR = self.tmp.name
+        server.scheduler.BASE_DIR = self.tmp.name
+        self.addCleanup(setattr, server, "BASE_DIR", self.orig_server_base)
+        self.addCleanup(setattr, server.scheduler, "BASE_DIR", self.orig_sched_base)
+
+        cfg = mock.MagicMock()
+        cfg.mode = "manual"
+        cfg.scheduler_cfg = _scheduler_cfg()
+        self.app = server.SpaServer(cfg)
+        self.app.refresh_plan = mock.MagicMock(return_value={"changed": False})
+
+    def _env(self):
+        return server.scheduler.load_env(os.path.join(self.tmp.name, "scheduler.env"))
+
+    def test_update_window_temps_and_override(self):
+        out = self.app.update_scheduler_config({
+            "window": "14:00-23:30", "target": 39, "eco": 26,
+            "floor": 7, "margin": 0.5,
+            "overrides": {"SAT": "10:00-23:00", "SUN": ""},
+        })
+        self.assertEqual(out["windows"], "14:00-23:30")
+        self.assertEqual(out["target"], 39)
+        self.assertEqual(out["eco"], 26)
+        self.assertEqual(out["floor"], 7)
+        self.assertEqual(out["margin"], 0.5)
+        self.assertEqual(out["overrides"]["SAT"], "10:00-23:00")
+        self.assertEqual(out["overrides"]["SUN"], "")
+        env = self._env()
+        self.assertEqual(env["WINDOW"], "14:00-23:30")
+        self.assertEqual(env["WINDOW_SAT"], "10:00-23:00")
+        self.assertNotIn("WINDOW_SUN", env)
+        self.app.refresh_plan.assert_called_once_with(apply=False)
+
+    def test_rejects_bad_window_and_temp_order(self):
+        with self.assertRaises(ValueError):
+            self.app.update_scheduler_config({"window": "23:00-17:00"})
+        with self.assertRaises(ValueError):
+            self.app.update_scheduler_config({"window": "nonsense"})
+        with self.assertRaises(ValueError):
+            self.app.update_scheduler_config({"target": 20, "eco": 28})
+        with self.assertRaises(ValueError):
+            self.app.update_scheduler_config({"target": 45})
+
+    def test_operation_log_keeps_newest(self):
+        self.app.add_log("ok", "one")
+        self.app.add_log("err", "two")
+        entries = self.app.get_log(1)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[-1]["msg"], "two")
+        self.assertEqual(entries[-1]["level"], "err")
+
+
 class TestAPIEndpoints(unittest.TestCase):
     """Spin a real ThreadingHTTPServer with a mocked SpaServer and hit it."""
 
@@ -141,6 +204,12 @@ class TestAPIEndpoints(unittest.TestCase):
         cls.app_mock = app
 
         server_mod = sys.modules["server"]
+        # keep POST /api/scheduler mode changes away from the real web.env
+        cls.tmp = tempfile.TemporaryDirectory()
+        with open(os.path.join(cls.tmp.name, "web.env"), "w") as f:
+            f.write("BIND=0.0.0.0\nPORT=8080\nMODE=manual\n")
+        cls.orig_base = server_mod.BASE_DIR
+        server_mod.BASE_DIR = cls.tmp.name
         cls.orig_cfg = server_mod.WebConfig
         server_mod.WebConfig = lambda: mock.MagicMock(bind="127.0.0.1", port=0,
                                                       mode="manual",
@@ -168,6 +237,8 @@ class TestAPIEndpoints(unittest.TestCase):
         cls.httpd.shutdown()
         cls.httpd.server_close()
         sys.modules["server"].WebConfig = cls.orig_cfg
+        sys.modules["server"].BASE_DIR = cls.orig_base
+        cls.tmp.cleanup()
 
     def _get(self, path):
         import urllib.request
@@ -226,13 +297,10 @@ class TestAPIEndpoints(unittest.TestCase):
         # handler sets app.cfg.mode then echoes it
         self.assertEqual(d["mode"], "auto")
         self.assertEqual(self.app_mock.cfg.mode, "auto")
-        # and it persisted to web.env
-        env = server.scheduler.load_env("web.env")
+        # and it persisted to the (temporary) web.env
+        env = server.scheduler.load_env(os.path.join(self.tmp.name, "web.env"))
         self.assertEqual(env.get("MODE"), "auto")
-        # restore
         self.app_mock.cfg.mode = "manual"
-        with open("web.env", "w") as f:
-            f.write("BIND=0.0.0.0\nPORT=8080\nMODE=manual\n")
 
     def test_unknown_route_404(self):
         import urllib.error

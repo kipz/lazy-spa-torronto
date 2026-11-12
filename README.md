@@ -123,7 +123,9 @@ thermostats call "optimal start"). Full derivation in [`SCHEDULER.md`](SCHEDULER
 
 A zero-dependency single-page app for control + visualisation: live
 temperature gauge, history chart, every device control, and the auto-heating
-scheduler — all in one browser tab. No npm, no CDN, no build step.
+scheduler — all in one browser tab. Edit use windows and temperatures from the
+UI, follow commands through to confirmation, and watch the live operation log.
+No npm, no CDN, no build step.
 
 ```mermaid
 flowchart LR
@@ -147,12 +149,13 @@ flowchart LR
 | GET | `/api/state` | Live shadow + mode + phase + setting |
 | GET | `/api/history?range=24` | Water/target/heater/ambient series (6h/24h/3d/7d) |
 | GET | `/api/plan` | 48 h optimal-start heater plan + energy |
-| GET | `/api/scheduler` | Mode, windows, target/eco/floor/margin |
-| POST | `/api/scheduler` | `{"mode":"auto"\|"manual"}` or `{"replan":true}` |
+| GET | `/api/scheduler` | Mode, windows, per-day overrides, target/eco/floor/margin |
+| POST | `/api/scheduler` | `{"mode":"auto"\|"manual"}`, `{"replan":true}`, or `{"config":{...}}` |
 | GET | `/api/weather` | Next-24 h forecast |
 | POST | `/api/cmd` | `{"datapoint","value"}` — clamped, temp rejected in auto |
 | GET | `/api/health` | Connectivity, last update age |
-| GET | `/api/events` | SSE live push (state/plan/mode) |
+| GET | `/api/log?limit=100` | Recent operations (commands, mode/settings changes) |
+| GET | `/api/events` | SSE live push (state/plan/mode/config/log) |
 
 Config in `web.env` (gitignored): `BIND`, `PORT`, `MODE`. Full docs in [`WEB.md`](WEB.md).
 </details>

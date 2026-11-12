@@ -4,6 +4,17 @@
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
+const DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
+const DP_LABELS = {
+  power_state: "Power",
+  heater_state: "Heat",
+  filter_state: "Filter",
+  wave_state: "Bubbles",
+  hydrojet_state: "Jet",
+  locked: "Panel lock",
+  temperature_setting: "Target temperature",
+};
+
 const state = {
   mode: "manual",
   shadow: {},
@@ -11,6 +22,8 @@ const state = {
   plan: null,
   history: [],
   weather: [],
+  config: null,
+  log: [],
   range: 24,
   tempLocked: false,
 };
@@ -24,6 +37,47 @@ async function api(path, opts = {}) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
   return data;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function fmtTime(ts) {
+  if (!ts) return "--:--:--";
+  return new Date(ts * 1000).toLocaleTimeString([], {
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  });
+}
+
+function describeValue(dp, value) {
+  if (dp === "temperature_setting") return value + "°C";
+  return Number(value) ? "ON" : "OFF";
+}
+
+/* A read-back uses richer values than the write (e.g. filter_state=2,
+ * heater_state=4..8), so compare truthiness for switches. */
+function isReflected(dp, shadow, value) {
+  const got = shadow ? shadow[dp] : undefined;
+  if (got === undefined || got === null || got === "") return false;
+  if (dp === "temperature_setting") return Number(got) === Number(value);
+  return Boolean(Number(got)) === Boolean(Number(value));
+}
+
+async function waitForReflection(dp, value, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const d = await api("/api/state");
+      state.mode = d.mode;
+      state.shadow = d.state || {};
+      if (d.ts) state.shadow._ts = d.ts;
+      if (d.phase) state.phase = d.phase;
+      syncMode();
+      reflectShadow();
+      if (isReflected(dp, state.shadow, value)) return true;
+    } catch (e) { /* keep waiting through transient errors */ }
+    await sleep(1000);
+  }
+  return false;
 }
 
 /* ---------------- toasts ---------------- */
@@ -48,6 +102,40 @@ function confirmDialog(text) {
     $("#confirmOk").onclick = () => { box.classList.add("hidden"); resolve(true); };
     $("#confirmCancel").onclick = () => { box.classList.add("hidden"); resolve(false); };
   });
+}
+
+/* ---------------- command progress modal ---------------- */
+let opCloseTimer = null;
+
+function openOpModal(title, detail) {
+  clearTimeout(opCloseTimer);
+  $("#opModal").classList.remove("hidden");
+  $("#opSpinner").classList.remove("hidden");
+  $("#opIcon").classList.add("hidden");
+  $("#opActions").classList.add("hidden");
+  $("#opCard").className = "modal-card glass op-card";
+  $("#opTitle").textContent = title;
+  $("#opDetail").textContent = detail || "";
+}
+
+function finishOpModal(kind, title, detail, autoCloseMs = 0) {
+  clearTimeout(opCloseTimer);
+  const icon = { ok: "✓", warn: "!", err: "✕" }[kind] || "•";
+  $("#opSpinner").classList.add("hidden");
+  $("#opIcon").className = "op-icon " + kind;
+  $("#opIcon").textContent = icon;
+  $("#opCard").className = "modal-card glass op-card " + kind;
+  $("#opTitle").textContent = title;
+  $("#opDetail").textContent = detail || "";
+  $("#opActions").classList.remove("hidden");
+  if (autoCloseMs) {
+    opCloseTimer = setTimeout(() => $("#opModal").classList.add("hidden"), autoCloseMs);
+  }
+}
+
+function closeOpModal() {
+  clearTimeout(opCloseTimer);
+  $("#opModal").classList.add("hidden");
 }
 
 /* ---------------- gauge ---------------- */
@@ -247,12 +335,21 @@ function syncMode() {
   $("#modeToggle").checked = auto;
   $("#modeLabel").textContent = auto ? "AUTO" : "MANUAL";
   $("#factPhase").textContent = state.phase ? state.phase.toUpperCase() : "—";
-  const locked = auto;
-  state.tempLocked = locked;
-  $("#tempRange").disabled = locked;
-  $("#tempRange").style.opacity = locked ? 0.4 : 1;
+
+  // Scheduler-owned controls are locked in AUTO. Bubbles/jet/lock stay live.
+  state.tempLocked = auto;
+  $("#tempRange").disabled = auto;
+  $("#tempCtl").classList.toggle("auto-locked", auto);
+  $("#autoLockBanner").classList.toggle("hidden", !auto);
+  $$('.tile input[data-owned="scheduler"]').forEach((inp) => {
+    inp.disabled = auto;
+    const tile = inp.closest(".tile");
+    tile.classList.toggle("auto-locked", auto);
+    tile.title = auto ? "Locked: the scheduler controls this in AUTO mode" : "";
+  });
+
   $("#autoHint").textContent = auto
-    ? "Auto mode: the scheduler chooses temperature_setting for you. Switch to manual to take over."
+    ? "Auto mode: the scheduler chooses power, heat, filter and target temperature. Switch to manual to take over."
     : "Manual mode: you are in control. Flip the switch to let the scheduler optimise heating.";
 }
 
@@ -287,13 +384,161 @@ function renderPlanStrip() {
   }
 }
 
+function renderConfig() {
+  const d = state.config || {};
+  $("#cfgWindow").textContent = d.windows || "—";
+  $("#cfgTemps").textContent = (d.target != null ? d.target : "—") + " / "
+    + (d.eco != null ? d.eco : "—") + " / " + (d.floor != null ? d.floor : "—");
+  $("#cfgMargin").textContent = (d.margin != null ? d.margin : "—") + "°";
+  const ov = d.overrides || {};
+  const active = DAYS.filter((day) => ov[day]).map((day) => day + " " + ov[day]);
+  $("#cfgOverrides").textContent = active.length ? active.join(", ") : "none";
+  if (d.phase) {
+    state.phase = d.phase;
+    $("#factPhase").textContent = d.phase.toUpperCase();
+  }
+}
+
 function refreshConfig() {
-  api("/api/scheduler").then((d) => {
-    $("#cfgWindow").textContent = d.windows || "—";
-    $("#cfgTemps").textContent = (d.target || "—") + " / " + (d.eco || "—") + " / " + (d.floor || "—");
-    $("#cfgMargin").textContent = d.margin + "°";
-    if (d.phase) { state.phase = d.phase; $("#factPhase").textContent = d.phase.toUpperCase(); }
+  return api("/api/scheduler").then((d) => {
+    state.config = d;
+    renderConfig();
   }).catch(() => {});
+}
+
+/* ---------------- heating settings modal ---------------- */
+function windowError(spec, label) {
+  const m = /^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/.exec(spec);
+  if (!m) return label + " must use HH:MM-HH:MM";
+  const sh = Number(m[1]), sm = Number(m[2]), eh = Number(m[3]), em = Number(m[4]);
+  if (sh > 23 || eh > 23 || sm > 59 || em > 59) return label + " must be between 00:00 and 23:59";
+  if (eh * 60 + em <= sh * 60 + sm) return label + " must end after it starts (overnight windows are not supported)";
+  return null;
+}
+
+function openSettings() {
+  const c = state.config || {};
+  const ov = c.overrides || {};
+  $("#setWindow").value = c.windows || "17:00-23:00";
+  $("#setTarget").value = c.target != null ? c.target : 40;
+  $("#setEco").value = c.eco != null ? c.eco : 28;
+  $("#setFloor").value = c.floor != null ? c.floor : 8;
+  $("#setMargin").value = c.margin != null ? c.margin : 0;
+  DAYS.forEach((day) => { $("#setWin" + day).value = ov[day] || ""; });
+  $("#settingsError").textContent = "";
+  $("#settingsModal").classList.remove("hidden");
+  setTimeout(() => $("#setWindow").focus(), 30);
+}
+
+function closeSettings() {
+  $("#settingsModal").classList.add("hidden");
+  $("#settingsError").textContent = "";
+}
+
+function validateSettings(payload) {
+  const err = windowError(payload.window, "Default window");
+  if (err) return err;
+  const raw = (v) => String(v == null ? "" : v).trim();
+  const target = Number(raw(payload.target));
+  const eco = Number(raw(payload.eco));
+  const floor = Number(raw(payload.floor));
+  const margin = Number(raw(payload.margin));
+  if (!raw(payload.target) || !Number.isInteger(target) || target < 20 || target > 40) return "Target must be a whole number from 20 to 40";
+  if (!raw(payload.eco) || !Number.isInteger(eco) || eco < 5 || eco > 40) return "Eco must be a whole number from 5 to 40";
+  if (!raw(payload.floor) || !Number.isInteger(floor) || floor < 0 || floor > 40) return "Floor must be a whole number from 0 to 40";
+  if (!raw(payload.margin) || !Number.isFinite(margin) || margin < 0 || margin > 10) return "Margin must be between 0 and 10";
+  if (!(floor <= eco && eco <= target)) return "Temperatures must satisfy floor ≤ eco ≤ target";
+  for (const day of DAYS) {
+    const spec = payload.overrides[day];
+    if (!spec) continue;
+    const e = windowError(spec, day + " override");
+    if (e) return e;
+  }
+  return null;
+}
+
+async function saveSettings(e) {
+  e.preventDefault();
+  const payload = {
+    window: $("#setWindow").value.trim(),
+    target: $("#setTarget").value,
+    eco: $("#setEco").value,
+    floor: $("#setFloor").value,
+    margin: $("#setMargin").value,
+    overrides: {},
+  };
+  DAYS.forEach((day) => { payload.overrides[day] = $("#setWin" + day).value.trim(); });
+
+  const problem = validateSettings(payload);
+  if (problem) {
+    $("#settingsError").textContent = problem;
+    return;
+  }
+
+  const btn = $("#settingsSave");
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Saving…";
+  $("#settingsError").textContent = "";
+  try {
+    const d = await api("/api/scheduler", {
+      method: "POST",
+      body: JSON.stringify({ config: payload }),
+    });
+    state.config = d;
+    renderConfig();
+    closeSettings();
+    if (d.plan_error) {
+      toast("Settings saved — replan failed: " + d.plan_error, "err");
+    } else {
+      toast("Heating settings saved", "ok");
+    }
+    loadPlan();
+    loadLog();
+  } catch (err) {
+    $("#settingsError").textContent = err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+}
+
+/* ---------------- operation log ---------------- */
+function renderLog() {
+  const host = $("#opLog");
+  host.innerHTML = "";
+  if (!state.log.length) {
+    const p = document.createElement("p");
+    p.className = "log-empty";
+    p.textContent = "No operations yet.";
+    host.appendChild(p);
+    $("#logCount").textContent = "";
+    return;
+  }
+  const entries = state.log.slice().reverse();
+  for (const entry of entries) {
+    const row = document.createElement("div");
+    row.className = "log-item " + (entry.level || "info");
+    const time = document.createElement("span");
+    time.className = "log-time";
+    time.textContent = fmtTime(entry.ts);
+    const dot = document.createElement("i");
+    dot.className = "log-dot";
+    const msg = document.createElement("span");
+    msg.className = "log-msg";
+    msg.textContent = entry.msg;
+    row.append(time, dot, msg);
+    host.appendChild(row);
+  }
+  $("#logCount").textContent = state.log.length + " events";
+}
+
+async function loadLog() {
+  try {
+    const d = await api("/api/log?limit=120");
+    state.log = d.entries || [];
+    renderLog();
+  } catch (e) { /* keep the last known log */ }
 }
 
 /* ---------------- data loading ---------------- */
@@ -339,7 +584,7 @@ async function loadWeather() {
 
 async function refreshAll() {
   await loadState();
-  await Promise.all([loadHistory(), loadPlan(), loadWeather(), refreshConfig()]);
+  await Promise.all([loadHistory(), loadPlan(), loadWeather(), refreshConfig(), loadLog()]);
   const el = $("#conn");
   if (state.shadow && Object.keys(state.shadow).length) {
     const age = (Date.now() / 1000) - (state.shadow._ts || 0);
@@ -351,15 +596,42 @@ async function refreshAll() {
 
 /* ---------------- actions ---------------- */
 async function sendCmd(datapoint, value) {
+  const label = DP_LABELS[datapoint] || datapoint;
+  const shown = describeValue(datapoint, value);
+  openOpModal("Sending " + label + "…", "Waiting for the spa to accept the command.");
+
   try {
     const r = await api("/api/cmd", {
       method: "POST",
       body: JSON.stringify({ datapoint, value }),
     });
-    toast(datapoint + " = " + value + (r.confirmed ? " ✓" : " (sent, unconfirmed)"), r.confirmed ? "ok" : "err");
+    $("#opDetail").textContent = r.confirmed
+      ? "Accepted — waiting for the status feed to reflect it."
+      : "Sent — waiting for the spa to report the change.";
+
+    const reflected = await waitForReflection(datapoint, value,
+      r.confirmed ? 12000 : 15000);
+
+    if (reflected) {
+      finishOpModal("ok", label + " → " + shown,
+        "Confirmed by the spa status feed.", 1200);
+      toast(label + " → " + shown, "ok");
+    } else if (r.confirmed) {
+      finishOpModal("ok", label + " accepted",
+        "The spa accepted the command; the status feed will catch up shortly.");
+      toast(label + " accepted (status not yet updated)", "ok");
+    } else {
+      finishOpModal("warn", label + " not reflected yet",
+        "The command was sent, but the spa has not reported it. Check the connection or try again.");
+      toast(label + " sent, not yet reflected", "err");
+    }
+    await loadState();
+    loadLog();
   } catch (e) {
+    finishOpModal("err", label + " failed", e.message);
     toast(e.message, "err");
     await loadState(); // revert optimistic UI
+    loadLog();
   }
 }
 
@@ -375,6 +647,8 @@ async function toggleMode(auto) {
     toast(auto ? "Auto-heating ON — scheduler in control" : "Manual mode — you're in control");
     syncMode();
     loadPlan();
+    refreshConfig();
+    loadLog();
   } catch (e) {
     toast(e.message, "err");
     syncMode();
@@ -388,13 +662,32 @@ function bindEvents() {
       await api("/api/scheduler", { method: "POST", body: JSON.stringify({ replan: true }) });
       toast("Plan recomputed");
       loadPlan();
+      loadLog();
     } catch (e) { toast(e.message, "err"); }
+  });
+
+  $("#settingsBtn").addEventListener("click", openSettings);
+  $("#settingsCancel").addEventListener("click", closeSettings);
+  $("#settingsForm").addEventListener("submit", saveSettings);
+  $("#opClose").addEventListener("click", closeOpModal);
+  $("#settingsModal").addEventListener("click", (e) => {
+    if (e.target.id === "settingsModal") closeSettings();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (!$("#settingsModal").classList.contains("hidden")) {
+      closeSettings();
+    } else if (!$("#opModal").classList.contains("hidden")
+               && !$("#opActions").classList.contains("hidden")) {
+      closeOpModal();
+    }
   });
 
   $$(".tile input").forEach((inp) => {
     inp.addEventListener("change", () => {
       const dp = inp.dataset.dp;
       if (dp === "temperature_setting") return;
+      if (inp.disabled) { reflectShadow(); return; }
       sendCmd(dp, inp.checked ? 1 : 0);
     });
   });
@@ -426,8 +719,11 @@ function connectSSE() {
   es.onmessage = (ev) => {
     try {
       const d = JSON.parse(ev.data);
-      if (d.kind === "state" || d.kind === "mode") refreshAll();
-      else if (d.kind === "plan") loadPlan();
+      if (d.kind === "state") loadState();
+      else if (d.kind === "mode") refreshAll();
+      else if (d.kind === "plan") { loadPlan(); refreshConfig(); }
+      else if (d.kind === "config") { refreshConfig(); loadPlan(); }
+      else if (d.kind === "log") loadLog();
     } catch (e) { /* ignore */ }
   };
   es.onerror = () => {

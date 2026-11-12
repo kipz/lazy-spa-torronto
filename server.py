@@ -20,6 +20,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -31,9 +32,66 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 POLL_SECONDS = 15.0
 HISTORY_SECONDS = 7 * 86400        # keep ~1 week of history in memory
 SAMPLE_SECONDS = 60                # throttle JSONL appends to 1/min
+LOG_MAX = 300                      # operation log entries kept in memory
+DAY_NAMES = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+WINDOW_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$")
+DP_LOG_LABELS = {
+    "power_state": "Power", "heater_state": "Heat", "filter_state": "Filter",
+    "wave_state": "Bubbles", "hydrojet_state": "Jet", "locked": "Panel lock",
+    "temperature_setting": "Target temperature",
+}
 
 import scheduler  # noqa: E402
 import spa  # noqa: E402
+
+
+def validate_window(spec):
+    """Validate/normalise an HH:MM-HH:MM use window."""
+    spec = str(spec or "").strip()
+    m = WINDOW_RE.match(spec)
+    if not m:
+        raise ValueError("window must be HH:MM-HH:MM (got %r)" % spec)
+    sh, sm, eh, em = (int(x) for x in m.groups())
+    if sh > 23 or eh > 23 or sm > 59 or em > 59:
+        raise ValueError("window times must be 00:00-23:59")
+    if eh * 60 + em <= sh * 60 + sm:
+        raise ValueError("window end must be after start (overnight windows are not supported)")
+    return "%02d:%02d-%02d:%02d" % (sh, sm, eh, em)
+
+
+def _int_setting(name, value, lo, hi):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("%s must be an integer" % name)
+    if not (lo <= n <= hi):
+        raise ValueError("%s must be between %d and %d" % (name, lo, hi))
+    return n
+
+
+def _float_setting(name, value, lo, hi):
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("%s must be a number" % name)
+    if not (lo <= n <= hi):
+        raise ValueError("%s must be between %g and %g" % (name, lo, hi))
+    return n
+
+
+def scheduler_payload(app):
+    cfg = app.cfg.scheduler_cfg
+    return {
+        "mode": app.cfg.mode,
+        "windows": cfg["WINDOW"],
+        "overrides": {day: cfg.get("WINDOW_" + day) or "" for day in DAY_NAMES},
+        "target": int(cfg["TARGET_TEMP"]),
+        "eco": int(cfg["ECO_TEMP"]),
+        "floor": int(cfg["FLOOR_TEMP"]),
+        "margin": float(cfg["MARGIN"]),
+        "phase": app._plan["phase"] if app._plan else None,
+        "setting": app._plan["setting"] if app._plan else None,
+    }
 
 
 class WebConfig:
@@ -77,12 +135,17 @@ class SpaServer:
         self._plan_ts = 0.0
         self._tokens = None
         self._stopping = False
+        self._log = []              # recent operations, newest last
+        self._log_lock = threading.Lock()
         # resolve location once (from scheduler.env: LOCATION or LAT/LON)
         try:
             lat, lon, where = scheduler.resolve_location(cfg.scheduler_cfg)
         except SystemExit:
             lat, lon, where = 51.5074, -0.1278, "London, GB (default)"
         self._lat, self._lon, self._where = lat, lon, where
+        self.add_log("info", "Server started in %s mode (window %s, target %d°C)"
+                     % (cfg.mode, cfg.scheduler_cfg["WINDOW"],
+                        int(cfg.scheduler_cfg["TARGET_TEMP"])))
 
     # -- state -----------------------------------------------------------
     def update_state(self, state):
@@ -117,6 +180,20 @@ class SpaServer:
         with self._lock:
             return [dict(h) for h in self._history if h["ts"] >= cutoff]
 
+    # -- operation log -----------------------------------------------------
+    def add_log(self, level, msg):
+        entry = {"ts": int(time.time()), "level": level, "msg": str(msg)}
+        with self._log_lock:
+            self._log.append(entry)
+            if len(self._log) > LOG_MAX:
+                del self._log[:-LOG_MAX]
+        self._broadcast("log")
+        return entry
+
+    def get_log(self, limit=100):
+        with self._log_lock:
+            return [dict(e) for e in self._log[-int(limit):]]
+
     # -- SSE --------------------------------------------------------------
     def _broadcast(self, kind):
         msg = json.dumps({"kind": kind, "ts": int(time.time())}) + "\n\n"
@@ -143,6 +220,9 @@ class SpaServer:
             tokens=self._get_tokens(), apply=apply)
         self._plan = res
         self._plan_ts = time.time()
+        if apply and res.get("changed"):
+            self.add_log("info", "Auto mode applied target %d°C (%s phase)"
+                         % (int(res.get("setting") or 0), res.get("phase") or "?"))
         self._broadcast("plan")
         return res
 
@@ -173,11 +253,85 @@ class SpaServer:
                 raise ValueError("value must be an integer")
         if datapoint != "temperature_setting" and value not in (0, 1):
             raise ValueError("value must be 0 or 1")
-        resp = spa.send_command(self._get_tokens(), datapoint, value)
-        # confirm in shadow
-        ok = spa.wait_for(self._get_tokens(), datapoint, value, timeout=20)
+        shown = ("%d°C" % value if datapoint == "temperature_setting"
+                 else ("ON" if value else "OFF"))
+        label = DP_LOG_LABELS.get(datapoint, datapoint)
+        self.add_log("info", "Sending %s → %s" % (label, shown))
+        try:
+            resp = spa.send_command(self._get_tokens(), datapoint, value)
+            # confirm in shadow
+            ok = spa.wait_for(self._get_tokens(), datapoint, value, timeout=20)
+        except Exception as e:
+            self.add_log("err", "%s → %s failed: %s" % (label, shown, e))
+            raise
+        self.add_log("ok" if ok else "warn", "%s → %s %s"
+                     % (label, shown,
+                        "confirmed" if ok else "sent, not yet confirmed"))
         return {"datapoint": datapoint, "value": value, "confirmed": ok,
                 "response": resp}
+
+    # -- scheduler config --------------------------------------------------
+    def update_scheduler_config(self, payload):
+        """Validate + persist scheduler settings, then replan."""
+        if not isinstance(payload, dict):
+            raise ValueError("config must be an object")
+        path = os.path.join(BASE_DIR, "scheduler.env")
+        env = scheduler.load_env(path)
+        cur = self.cfg.scheduler_cfg
+
+        # Validate the whole prospective config before writing anything.
+        target = _int_setting("target", payload.get("target", cur["TARGET_TEMP"]), 20, 40)
+        eco = _int_setting("eco", payload.get("eco", cur["ECO_TEMP"]), 5, 40)
+        floor = _int_setting("floor", payload.get("floor", cur["FLOOR_TEMP"]), 0, 40)
+        margin = _float_setting("margin", payload.get("margin", cur["MARGIN"]), 0, 10)
+        if not (floor <= eco <= target):
+            raise ValueError("temperatures must satisfy floor ≤ eco ≤ target")
+
+        if "window" in payload:
+            env["WINDOW"] = validate_window(payload["window"])
+
+        overrides = payload.get("overrides") or {}
+        if not isinstance(overrides, dict):
+            raise ValueError("overrides must be an object")
+        for day in DAY_NAMES:
+            if day not in overrides:
+                continue
+            spec = str(overrides.get(day) or "").strip()
+            key = "WINDOW_" + day
+            if spec:
+                env[key] = validate_window(spec)
+            else:
+                env.pop(key, None)
+
+        env["TARGET_TEMP"] = str(target)
+        env["ECO_TEMP"] = str(eco)
+        env["FLOOR_TEMP"] = str(floor)
+        env["MARGIN"] = ("%g" % margin)
+        with open(path, "w") as f:
+            for key in sorted(env):
+                f.write("%s=%s\n" % (key, env[key]))
+
+        self.cfg.scheduler_cfg = scheduler.load_config()
+        cfg = self.cfg.scheduler_cfg
+        summary = ("window %s, target %d°C, eco %d°C, floor %d°C, margin %g°C"
+                   % (cfg["WINDOW"], int(cfg["TARGET_TEMP"]), int(cfg["ECO_TEMP"]),
+                      int(cfg["FLOOR_TEMP"]), float(cfg["MARGIN"])))
+
+        replanned, plan_error = False, None
+        try:
+            self.refresh_plan(apply=(self.cfg.mode == "auto"))
+            replanned = True
+        except Exception as e:
+            plan_error = str(e)
+
+        self.add_log("ok" if not plan_error else "warn",
+                     "Heating settings updated — %s%s"
+                     % (summary, "" if not plan_error else " (replan failed)"))
+        self._broadcast("config")
+        out = scheduler_payload(self)
+        out["replanned"] = replanned
+        out["plan_error"] = plan_error
+        return out
 
     # -- tokens --------------------------------------------------------------
     def _get_tokens(self):
@@ -195,7 +349,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
         if path in ("/api/state", "/api/health", "/api/history", "/api/plan",
-                    "/api/scheduler", "/api/weather"):
+                    "/api/scheduler", "/api/weather", "/api/log"):
             self._api(path)
         elif path == "/api/events":
             self._sse()
@@ -256,16 +410,14 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._send_json(502, {"error": str(e)})
             self._send_json(200, app._plan)
         elif path == "/api/scheduler":
-            self._send_json(200, {
-                "mode": app.cfg.mode,
-                "windows": app.cfg.scheduler_cfg["WINDOW"],
-                "target": app.cfg.scheduler_cfg["TARGET_TEMP"],
-                "eco": app.cfg.scheduler_cfg["ECO_TEMP"],
-                "floor": app.cfg.scheduler_cfg["FLOOR_TEMP"],
-                "margin": app.cfg.scheduler_cfg["MARGIN"],
-                "phase": app._plan["phase"] if app._plan else None,
-                "setting": app._plan["setting"] if app._plan else None,
-            })
+            self._send_json(200, scheduler_payload(app))
+        elif path == "/api/log":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                limit = int(qs.get("limit", ["100"])[0])
+            except ValueError:
+                limit = 100
+            self._send_json(200, {"entries": app.get_log(max(1, min(limit, LOG_MAX)))})
         elif path == "/api/weather":
             try:
                 weather = scheduler.fetch_forecast(app._lat, app._lon, forecast_days=2)
@@ -298,6 +450,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _api_scheduler(self, body):
         app = self.server.app  # type: ignore[attr-defined]
+
+        # Full heating-settings update from the UI.
+        if body.get("config") is not None:
+            try:
+                out = app.update_scheduler_config(body["config"])
+            except ValueError as e:
+                return self._send_json(400, {"error": str(e)})
+            except Exception as e:
+                return self._send_json(502, {"error": str(e)})
+            return self._send_json(200, out)
+
         mode = body.get("mode")
         if mode in ("auto", "manual"):
             app.cfg.mode = mode
@@ -308,18 +471,22 @@ class _Handler(BaseHTTPRequestHandler):
             with open(path, "w") as f:
                 for k, v in sorted(existing.items()):
                     f.write("%s=%s\n" % (k, v))
+            app.add_log("info", "Mode → %s" % mode.upper())
             app._broadcast("mode")
             if mode == "auto":
                 try:
                     app.refresh_plan(apply=True)
                 except Exception as e:
+                    app.add_log("err", "Auto start failed: %s" % e)
                     return self._send_json(502, {"error": "auto-start failed: %s" % e})
         if body.get("replan"):
             try:
                 app.refresh_plan(apply=(app.cfg.mode == "auto"))
+                app.add_log("info", "Heating plan recomputed")
             except Exception as e:
+                app.add_log("err", "Replan failed: %s" % e)
                 return self._send_json(502, {"error": str(e)})
-        self._send_json(200, {"mode": app.cfg.mode})
+        self._send_json(200, scheduler_payload(app))
 
     # -- static + SSE ---------------------------------------------------------
     def _static(self, name, ctype=None):
@@ -388,6 +555,7 @@ def _poller_loop(app, stop_event):
             app.update_state(state)
         except Exception as e:
             print("[%s] poller error: %s" % (time.strftime("%F %T"), e), flush=True)
+            app.add_log("err", "Spa poll failed: %s" % e)
         # plan refresh aligned to hour boundaries (weather API budget + so the
         # preheat/window transitions are picked up on time)
         if now >= next_plan:

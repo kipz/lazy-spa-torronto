@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Keep the pinned GitHub Actions up to date (SHA pins in .github/workflows).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(ci)"
+    # Dependabot will propose bumping the version tag; the SHA pin must be
+    # updated to match (see the pin-comment convention in ci.yml).
+    groups:
+      actions:
+        patterns: ["*"]

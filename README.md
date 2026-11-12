@@ -9,8 +9,11 @@ Reverse-engineered protocol for the **Lay-Z-Spa Toronto AirJet Plus (UltraFit)**
 
 [![Python](https://img.shields.io/badge/python-3.8+-3776AB?logo=python&logoColor=white)](https://www.python.org)
 [![Deps](https://img.shields.io/badge/deps-none%20(stdlib)-brightgreen)](#)
+[![CI](https://github.com/kipz/lazy-spa-torronto/actions/workflows/ci.yml/badge.svg)](https://github.com/kipz/lazy-spa-torronto/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-unittest%20passing-brightgreen)](#)
 [![Protocol](https://img.shields.io/badge/status-verified%20end--to--end-brightgreen)](#)
 [![RE](https://img.shields.io/badge/reverse--engineered-2026--10--17-9cf)](#)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
 
 </div>
 
@@ -22,7 +25,8 @@ Reverse-engineered protocol for the **Lay-Z-Spa Toronto AirJet Plus (UltraFit)**
 |---|---|
 | 🧪 **Reverse-engineered** | Login route, MD5 password quirk, signing scheme — all from `libapp.so` |
 | ⌨️ **Full control** | Power, heat, filter, AirJet, HydroJet, lock, target temp |
-| 🧩 **Zero dependencies** | Pure Python stdlib, single file (`spa.py`) |
+| 🌡️ **Smart heating** | Weather-aware scheduler preheats to 40 °C by window start, kWh-optimised |
+| 🧩 **Zero dependencies** | Pure Python stdlib, two files (`spa.py` + `scheduler.py`) |
 | 🔐 **Cached auth** | Login once, tokens cached — no repeated logins that kill the app session |
 | 📡 **Live monitoring** | `watch` polls the cloud shadow and prints on change |
 
@@ -56,9 +60,62 @@ python3 scheduler.py run             # apply it continuously (see SCHEDULER.md)
 | `raw <datapoint> <value>` | Arbitrary datapoint write |
 | `ota` | Check for published firmware updates |
 
-> 🌡️ **Weather-aware heating scheduler** — `scheduler.py plan` prints the
-> energy-optimal 48 h heater plan (Open-Meteo forecast, no API key),
-> `scheduler.py run` applies it. See [`SCHEDULER.md`](SCHEDULER.md).
+> 🌡️ Weather-aware heating scheduler — see [below](#-heating-scheduler).
+
+## 🌡️ Heating scheduler
+
+A weather-aware controller that plans *when* the 2 kW heater runs so the tub
+hits **TARGET_TEMP (default 40 °C) exactly at the start of each use window**,
+while burning as little energy as possible. It uses a free hourly forecast and
+a fitted thermal model, and re-plans every hour.
+
+```mermaid
+flowchart LR
+    W[Open-Meteo<br/>hourly forecast] -->|"temperature_2m"| S[Thermal model<br/>C·dT/dt = P·u − UA·ΔT]
+    S -->|"T_amb(t)"| O[Backward induction<br/>optimal start]
+    O -->|"heat on/off plan"| C[Controller<br/>scheduler.py run]
+    C -->|"temperature_setting<br/>40 ⇄ 28"| P[Spa thermostat]
+    P -.->|"water_temperature"| S
+```
+
+1. **Forecast** — Open-Meteo (free, no key; UKMO model for UK), geocoded from `LOCATION`.
+2. **Model** — `C` from 1250 L water, `P` ≈ 2 kW heater, `UA` loss coefficient fitted by `calibrate`.
+3. **Optimise** — backward induction finds the **energy-minimal bang-bang policy**: heat at full power as *late as possible*, hold during the window, coast overnight.
+4. **Apply** — `run` re-plans hourly and switches `temperature_setting` (40 in-window, 28 eco), letting the spa's own thermostat do the on/off.
+
+<details>
+<summary><b>📋 Scheduler reference</b> (click to expand)</summary>
+
+| Command | Effect |
+|---|---|
+| `scheduler.py plan` | Print the 48 h heater plan (dry run) |
+| `scheduler.py plan --simulate` | Offline demo with synthetic weather |
+| `scheduler.py run` | Persistent controller (applies to the spa) |
+| `scheduler.py run --dry-run` | Log what it would do, touch nothing |
+| `scheduler.py calibrate` | Fit `UA`/`P` from `shadow_log.jsonl` + historical weather |
+| `scheduler.py selftest` | Physics sanity checks |
+
+**Config** (`scheduler.env`, gitignored):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `LOCATION` | `London, UK` | City/postcode (geocoded) or `LAT`/`LON` |
+| `WINDOW` | `17:00-23:00` | Use window; per-day overrides `WINDOW_SAT`… |
+| `TARGET_TEMP` | `40` | Setpoint during windows (device clamp: 40) |
+| `ECO_TEMP` | `28` | Comfort floor while unused |
+| `FLOOR_TEMP` | `8` | Hard floor (freeze protection) |
+| `MARGIN` | `0` | Extra °C held above target (sensor offset) |
+
+**Optimality:** for a first-order thermal system with a deadline, holding
+temperature costs more than coasting down and reheating — so the minimum-energy
+policy is bang-bang, heating as late as possible (the same structure smart
+thermostats call "optimal start"). Full derivation in [`SCHEDULER.md`](SCHEDULER.md).
+</details>
+
+> [!NOTE]
+> **Calibrate it for accuracy.** Defaults (`UA=0.03 kW/°C`, `P=2 kW`) work, but
+> running `scheduler.py calibrate` after one overnight coast + heating cycle
+> fits your tub's real numbers and tightens preheat timing.
 
 ## 🗺️ How it works
 
@@ -94,6 +151,22 @@ flowchart LR
 Raw registers (`B0–B9`, `P0–P2`, `W0`) remain **undecoded** — a TODO.
 </details>
 
+## 🧪 Testing & CI
+
+Zero-dependency `unittest` suite covering the protocol helper (signing, HTTP,
+status formatting) and the scheduler (windows, weather, thermal model,
+optimal-start invariants, calibration, controller phases).
+
+```bash
+python -m unittest discover -s tests -v   # run the suite
+python scheduler.py selftest              # policy sanity checks
+```
+
+**CI** (`.github/workflows/ci.yml`) runs every push/PR on **Python 3.8–3.12**:
+compile check → unit tests → scheduler selftest → offline simulation. Actions
+are pinned to commit SHAs and the workflow runs with `contents: read` only.
+See [`SECURITY.md`](SECURITY.md) for the security policy.
+
 ## 📚 Documentation
 
 | File | Contents |
@@ -104,6 +177,7 @@ Raw registers (`B0–B9`, `P0–P2`, `W0`) remain **undecoded** — a TODO.
 | [`SCHEDULER.md`](SCHEDULER.md) | Weather-aware heating scheduler: model, optimality, usage |
 | [`COMMUNITY_POST.md`](COMMUNITY_POST.md) | Ready-to-paste writeup for issue #88 |
 | [`docs/datapoints-FTEW0E.json`](docs/datapoints-FTEW0E.json) | Official manufacturer datapoint definition |
+| [`SECURITY.md`](SECURITY.md) | Vulnerability reporting & hardening notes |
 
 ## ⚠️ Caveats
 
@@ -124,4 +198,4 @@ The novel contributions here: the `app-api.lay-z-spa.co.uk` route map and the MD
 
 ## 🔒 License
 
-[Unlicense](https://unlicense.org) — public domain. See [`LICENSE`](LICENSE).
+[Apache License 2.0](LICENSE) — © 2026 James Catnegie. See [`LICENSE`](LICENSE).

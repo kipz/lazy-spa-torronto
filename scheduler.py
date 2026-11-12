@@ -188,10 +188,13 @@ def windows_from_config(cfg):
 
 
 def in_window(ts, windows):
-    """ts is epoch seconds; decide using local wall clock."""
+    """ts is epoch seconds; decide using local wall clock.
+
+    A missing weekday key means "no window that day" (returns False).
+    """
     local = dt.datetime.fromtimestamp(ts)
     hm = (local.hour, local.minute)
-    for s, e in windows[local.weekday()]:
+    for s, e in windows.get(local.weekday(), []):
         if s <= hm < e:
             return True
     return False
@@ -245,6 +248,7 @@ def simulate(cfg, series, T0, windows, u_schedule=None, verbose=False):
                 energy += loss * step
         else:
             T = T - step / C * loss
+        T = min(T, clamp)  # device hard clamp applies after every hour
         temps.append(T)
         us.append(u)
     return temps, us, energy

@@ -119,7 +119,50 @@ thermostats call "optimal start"). Full derivation in [`SCHEDULER.md`](SCHEDULER
 > running `scheduler.py calibrate` after one overnight coast + heating cycle
 > fits your tub's real numbers and tightens preheat timing.
 
-## 🗺️ How it works
+## 🕸️ Web UI
+
+A zero-dependency single-page app for control + visualisation: live
+temperature gauge, history chart, every device control, and the auto-heating
+scheduler — all in one browser tab. No npm, no CDN, no build step.
+
+```mermaid
+flowchart LR
+    B[Browser SPA<br/>vanilla JS + canvas] <-->|"REST + SSE"| S[server.py<br/>stdlib ThreadingHTTPServer]
+    S -->|"shadow poll / commands"| A[spa.py cloud API]
+    S -->|"auto-heat loop"| C[scheduler.py optimal start]
+    S -->|"forecast"| W[Open-Meteo]
+    S -->|"history"| L[shadow_log.jsonl]
+```
+
+1. **Serve** — `python3 server.py` → http://localhost:8080/ (binds `0.0.0.0`, config in `web.env`).
+2. **Watch** — a poller fetches the shadow every 15 s, appends history, and pushes live updates over SSE.
+3. **Control** — every device command (power/heat/filter/bubbles/jet/lock/temp) via the API, with the 40 °C clamp and temp-rejected-in-auto enforced server-side.
+4. **Auto-heat** — the Manual ⇄ Auto toggle hands heating to the scheduler (same `scheduler_step` as the CLI); Auto shows the live phase + 24 h heater plan.
+
+<details>
+<summary><b>📋 Web API reference</b> (click to expand)</summary>
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/state` | Live shadow + mode + phase + setting |
+| GET | `/api/history?range=24` | Water/target/heater/ambient series (6h/24h/3d/7d) |
+| GET | `/api/plan` | 48 h optimal-start heater plan + energy |
+| GET | `/api/scheduler` | Mode, windows, target/eco/floor/margin |
+| POST | `/api/scheduler` | `{"mode":"auto"\|"manual"}` or `{"replan":true}` |
+| GET | `/api/weather` | Next-24 h forecast |
+| POST | `/api/cmd` | `{"datapoint","value"}` — clamped, temp rejected in auto |
+| GET | `/api/health` | Connectivity, last update age |
+| GET | `/api/events` | SSE live push (state/plan/mode) |
+
+Config in `web.env` (gitignored): `BIND`, `PORT`, `MODE`. Full docs in [`WEB.md`](WEB.md).
+</details>
+
+> [!CAUTION]
+> **No authentication — trusted LAN only.** The server controls a real device.
+> Restrict with `BIND=127.0.0.1` or put it behind an authenticated reverse
+> proxy; never expose it to the internet.
+
+## 🗺️ How the protocol works
 
 ```mermaid
 flowchart LR
@@ -156,8 +199,9 @@ Raw registers (`B0–B9`, `P0–P2`, `W0`) remain **undecoded** — a TODO.
 ## 🧪 Testing & CI
 
 Zero-dependency `unittest` suite covering the protocol helper (signing, HTTP,
-status formatting) and the scheduler (windows, weather, thermal model,
-optimal-start invariants, calibration, controller phases).
+status formatting), the scheduler (windows, weather, thermal model,
+optimal-start invariants, calibration, controller phases), and the web server
+(API endpoints, command validation, mode switching — all cloud/weather mocked).
 
 ```bash
 python -m unittest discover -s tests -v   # run the suite
@@ -168,6 +212,7 @@ python scheduler.py selftest              # policy sanity checks
 compile check → unit tests → scheduler selftest → offline simulation. Actions
 are pinned to commit SHAs and the workflow runs with `contents: read` only.
 See [`SECURITY.md`](SECURITY.md) for the security policy.
+
 ## 📚 Documentation
 
 | File | Contents |

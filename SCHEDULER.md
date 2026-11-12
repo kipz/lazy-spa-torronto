@@ -120,7 +120,7 @@ through one full overnight coast (heater off) plus one heating cycle.
   so even a bad forecast cannot schedule the tub below freezing.
 
 ## Safety notes
-- This is unofficial reverse-engineered control of a real device. Test with
+- This is unofficial control of a real device. Test with
   `plan` and `run --dry-run` before letting it drive the tub.
 - The displayed temperature is a compartment sensor (see SENSOR_HACK.md), so
   keep `MARGIN` ≥ the observed display-vs-bulk offset if the tub must be

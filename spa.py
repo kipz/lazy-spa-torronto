@@ -2,7 +2,7 @@
 """
 Lay-Z-Spa (Toronto UltraFit) cloud control CLI.
 
-Reverse-engineered protocol for the Bestway Lay-Z-Spa Android/iOS app
+Unofficial protocol notes for the Bestway Lay-Z-Spa Android/iOS app
 ("Lay-Z-Spa WiFi App", com.wiltonbradley.layzspaapp):
 
   1. Account login goes to the Laravel gateway  app-api.lay-z-spa.co.uk
@@ -47,7 +47,7 @@ import urllib.request
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# --- constants discovered by reverse engineering (see PROTOCOL.md) -----------
+# --- constants identified from the app (see PROTOCOL.md) ---------------------
 APPID = "AhFLL54HnChhrxcl9ZUJL6QNfolTIB"
 APPSECRET = "4ECvVs13enL5AiYSmscNjvlaisklQDz7vWPCCWXcEFjhWfTmLT"
 LARAVEL_ROOT = "https://app-api.lay-z-spa.co.uk"

@@ -1,7 +1,7 @@
 # Research Log - 2026-10-17
 
 Goal: integrate a Lay-Z-Spa Toronto (UltraFit pump) into the home IoT network
-by reverse-engineering the official app's cloud protocol.
+by studying the official app's cloud protocol.
 
 ## Environment
 

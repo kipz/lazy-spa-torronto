@@ -2,17 +2,17 @@
 
 # 🌊 torronto
 
-**Lay-Z-Spa · full cloud read/write control from the command line**
+**Lay-Z-Spa · cloud read/write control from the command line**
 
-Reverse-engineered protocol for the **Lay-Z-Spa Toronto AirJet Plus (UltraFit)**
-— the piece that had stumped the community since the app's 2024 backend migration.
+Unofficial protocol notes for the **Lay-Z-Spa Toronto AirJet Plus (UltraFit)**,
+worked out from the app's traffic — hopefully useful to others doing the same.
 
 [![Python](https://img.shields.io/badge/python-3.8+-3776AB?logo=python&logoColor=white)](https://www.python.org)
 [![Deps](https://img.shields.io/badge/deps-none%20(stdlib)-brightgreen)](#)
 [![CI](https://github.com/kipz/lazy-spa-torronto/actions/workflows/ci.yml/badge.svg)](https://github.com/kipz/lazy-spa-torronto/actions/workflows/ci.yml)
 [![Tests](https://img.shields.io/badge/tests-unittest%20passing-brightgreen)](#)
 [![Protocol](https://img.shields.io/badge/status-verified%20end--to--end-brightgreen)](#)
-[![RE](https://img.shields.io/badge/reverse--engineered-2026--10--17-9cf)](#)
+[![RE](https://img.shields.io/badge/studied-2026--10--17-9cf)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
 
 </div>
@@ -23,7 +23,7 @@ Reverse-engineered protocol for the **Lay-Z-Spa Toronto AirJet Plus (UltraFit)**
 
 | | |
 |---|---|
-| 🧪 **Reverse-engineered** | Login route, MD5 password quirk, signing scheme — all from `libapp.so` |
+| 🧪 **Unofficial** | Login route, MD5 password quirk, signing scheme — inferred from `libapp.so` |
 | ⌨️ **Full control** | Power, heat, filter, AirJet, HydroJet, lock, target temp |
 | 🌡️ **Smart heating** | Weather-aware scheduler preheats to 40 °C by window start, kWh-optimised |
 | 🕸️ **Web UI** | Zero-dep single-page app: live gauge, history chart, full controls, auto-heat |
@@ -172,7 +172,7 @@ flowchart LR
     H <-->|"device shadow"| S[Spa WiFi module]
 ```
 
-1. **Login** — `POST /v1/login` with the **MD5 hash** of your password (not the password itself — this was the missing piece).
+1. **Login** — `POST /v1/login` with the **MD5 hash** of your password (not the password itself — a detail that took a while to pin down).
 2. **Identity** — the response carries the spa's `did`, `product_key` and an MXCHIP visitor token.
 3. **Data plane** — read via `thing_shadow`, write via `device/command`, every request signed with `sign = UPPERCASE(MD5(appid + appsecret + nonce + ts))`.
 
@@ -241,7 +241,7 @@ See [`SECURITY.md`](SECURITY.md) for the security policy.
 
 Built on community research — [cdpuk/ha-bestway](https://github.com/cdpuk/ha-bestway) (issue [#88](https://github.com/cdpuk/ha-bestway/issues/88), [our writeup](https://github.com/cdpuk/ha-bestway/issues/88#issuecomment-6233830512)), [gklka/homebridge-layzspa](https://github.com/gklka/homebridge-layzspa), [epheterson/bestway-spa-v2](https://github.com/epheterson/bestway-spa-v2), [M1R4G376/New_bestway_spa](https://github.com/M1R4G376/New_bestway_spa), [andiwirz/homey-lay](https://github.com/andiwirz/homey-lay), and the [Home Assistant thread](https://community.home-assistant.io/t/lay-z-spa-hot-tub-wi-fi-pump-automation/229006).
 
-The novel contributions here: the `app-api.lay-z-spa.co.uk` route map and the MD5 password quirk.
+Our small contribution here: documenting the `app-api.lay-z-spa.co.uk` route map and the MD5 password quirk, in the hope they save someone the same digging.
 
 ## 🔒 License
 

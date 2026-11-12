@@ -2,9 +2,10 @@
 
 ## Reporting a vulnerability
 
-This project reverse-engineers an unofficial cloud API for a consumer device.
-If you find a security issue in the code, the protocol documentation, or the
-scheduler's handling of credentials — **please do not open a public issue**.
+This project documents an unofficial client for a consumer device's cloud
+API. If you find a security issue in the code, the protocol documentation,
+or the scheduler's handling of credentials — **please do not open a public
+issue**.
 
 Contact the maintainer **via GitHub's private security advisory** (repo →
 Security → Report a vulnerability) — this avoids exposing details publicly

@@ -1,10 +1,10 @@
 # Lay-Z-Spa Protocol Notes
 
-Reverse-engineered on 2026-10-17 from the **Lay-Z-Spa WiFi App** (Android,
-`com.wiltonbradley.layzspaapp` v2.2.2, Flutter) controlling a **Lay-Z-Spa
-Toronto AirJet Plus (UltraFit pump, product_key `FTEW0E`)**.
+Unofficial notes, worked out on 2026-10-17 from the **Lay-Z-Spa WiFi App**
+(Android, `com.wiltonbradley.layzspaapp` v2.2.2, Flutter) controlling a
+**Lay-Z-Spa Toronto AirJet Plus (UltraFit pump, product_key `FTEW0E`)**.
 
-This is the piece the community has been missing since the app's backend
+The account-side flow described here had been unclear since the app's backend
 migration in April 2024 (see cdpuk/ha-bestway issue #88, where the gateway
 host was found in 2025 but the endpoints were never decoded - the login
 lives in the app's Flutter `libapp.so` and bypasses HTTP proxies).

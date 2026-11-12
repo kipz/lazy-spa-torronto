@@ -7,9 +7,9 @@ are repeated here for completeness.
 
 ---
 
-**Solved: the Lay-Z-Spa app's account gateway (`app-api.lay-z-spa.co.uk`) — login route found, plus the client-side password hashing that made it untraceable**
+**A working route found: the Lay-Z-Spa app's account gateway (`app-api.lay-z-spa.co.uk`) — login route + the client-side password hashing**
 
-Huge thanks to everyone in this thread — this builds directly on your work: @TechnoTaff identified the gateway host from a packet trace when Charles couldn't see it, and @bobbyverlaan / @Andrerm124 / @jteno documented the smarthub appid/secret/sign scheme and the device flow. What was still missing was the *account* side: which endpoint the app's `libapp.so` actually POSTs the email/password to, and in what form. Here it is, verified end-to-end today against a **Lay-Z-Spa Toronto AirJet Plus (UltraFit pump, product_key `FTEW0E`)** on the current Android app (`com.wiltonbradley.layzspaapp` v2.2.2).
+Huge thanks to everyone in this thread — this builds directly on your work: @TechnoTaff identified the gateway host from a packet trace when Charles couldn't see it, and @bobbyverlaan / @Andrerm124 / @jteno documented the smarthub appid/secret/sign scheme and the device flow. The *account* side was still unclear: which endpoint the app's `libapp.so` actually POSTs the email/password to, and in what form. Here's what I found, checked end-to-end today against a **Lay-Z-Spa Toronto AirJet Plus (UltraFit pump, product_key `FTEW0E`)** on the current Android app (`com.wiltonbradley.layzspaapp` v2.2.2).
 
 ## TL;DR — the login
 
@@ -22,7 +22,7 @@ X-Requested-With: com.wiltonbradley.layzspa
 {"email": "you@example.com", "password": "<lowercase MD5 hex of your password>"}
 ```
 
-**The app sends `MD5(password)`, not the raw password.** That single detail is why this stayed unsolved since April 2024 — a proxy capture shows a hash that doesn't relate to your password in any obvious way, and replaying your real password gets you:
+**The app sends `MD5(password)`, not the raw password.** That detail took a while to pin down — a proxy capture shows a hash that doesn't relate to your password in any obvious way, and replaying your real password gets you:
 
 ```json
 {"errors":{"password":"Your password is incorrect"}}

@@ -6,3 +6,8 @@ shadow_log.jsonl
 
 # device-specific facts about the author's own unit (never publish)
 local_device.md
+
+# scheduler: local config, fitted model, log
+scheduler.env
+scheduler_model.json
+scheduler.log

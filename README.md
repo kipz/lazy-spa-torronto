@@ -35,6 +35,8 @@ python3 spa.py status                # live state of the tub
 python3 spa.py temp 38               # target temperature
 python3 spa.py wave on               # bubbles on 🌊
 python3 spa.py watch                 # poll every 15s, print on change
+python3 scheduler.py plan            # energy-optimal 48h heating plan (Open-Meteo)
+python3 scheduler.py run             # apply it continuously (see SCHEDULER.md)
 ```
 
 ## 🕹️ Commands
@@ -53,6 +55,10 @@ python3 spa.py watch                 # poll every 15s, print on change
 | `temp <20-40>` | Target temperature (spa's unit) |
 | `raw <datapoint> <value>` | Arbitrary datapoint write |
 | `ota` | Check for published firmware updates |
+
+> 🌡️ **Weather-aware heating scheduler** — `scheduler.py plan` prints the
+> energy-optimal 48 h heater plan (Open-Meteo forecast, no API key),
+> `scheduler.py run` applies it. See [`SCHEDULER.md`](SCHEDULER.md).
 
 ## 🗺️ How it works
 
@@ -95,6 +101,7 @@ Raw registers (`B0–B9`, `P0–P2`, `W0`) remain **undecoded** — a TODO.
 | [`PROTOCOL.md`](PROTOCOL.md) | Full protocol spec — endpoints, auth, signing, payloads |
 | [`RESEARCH_LOG.md`](RESEARCH_LOG.md) | Chronological RE session log, incl. all dead ends |
 | [`SENSOR_HACK.md`](SENSOR_HACK.md) | Engineering deep-dive: beating the 40°C cap |
+| [`SCHEDULER.md`](SCHEDULER.md) | Weather-aware heating scheduler: model, optimality, usage |
 | [`COMMUNITY_POST.md`](COMMUNITY_POST.md) | Ready-to-paste writeup for issue #88 |
 | [`docs/datapoints-FTEW0E.json`](docs/datapoints-FTEW0E.json) | Official manufacturer datapoint definition |
 

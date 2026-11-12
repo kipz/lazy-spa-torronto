@@ -15,6 +15,15 @@ worked out from the app's traffic — hopefully useful to others doing the same.
 [![RE](https://img.shields.io/badge/studied-2026--10--17-9cf)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
 
+<br>
+
+**Live dashboard — gauge, history, forecast & the optimal-start heating plan.**  
+The scheduler measures the tub's real cooling rate overnight and tightens preheat timing on its own.
+
+<a href="docs/torronto-demo.gif">
+  <img src="docs/torronto-demo.gif" alt="Torronto web dashboard demo" width="880">
+</a>
+
 </div>
 
 ---
@@ -26,7 +35,7 @@ worked out from the app's traffic — hopefully useful to others doing the same.
 | 🧪 **Unofficial** | Login route, MD5 password quirk, signing scheme — inferred from `libapp.so` |
 | ⌨️ **Full control** | Power, heat, filter, AirJet, HydroJet, lock, target temp |
 | 🌡️ **Smart heating** | Weather-aware scheduler preheats to 40 °C by window start, kWh-optimised |
-| 🕸️ **Web UI** | Zero-dep single-page app: live gauge, history chart, full controls, auto-heat |
+| 🕸️ **Web UI** | Zero-dep single-page app: live gauge, history chart, 3–7 day forecast & heating-plan chart, full controls, auto-heat |
 | 🧩 **Zero dependencies** | Pure Python stdlib, three files (`spa.py` + `scheduler.py` + `server.py`) |
 | 🔐 **Cached auth** | Login once, tokens cached — no repeated logins that kill the app session |
 | 📡 **Live monitoring** | `watch` polls the cloud shadow and prints on change |

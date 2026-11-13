@@ -234,6 +234,37 @@ class TestSpaServer(unittest.TestCase):
             self.app._maybe_notify({"water_temperature": 40})
         send.assert_not_called()
 
+    def test_tg_command_status(self):
+        self.app.update_state({**_shadow(), "water_temperature": 39,
+                               "temperature_setting": 40, "power_state": 1,
+                               "heater_state": 4, "filter_state": 2})
+        self.app._plan = {"phase": "preheat", "setting": 40}
+        s = self.app._tg_command("/status")
+        self.assertIn("Torronto", s)
+        self.assertIn("preheat", s)
+        self.assertIn("39°C", s)
+        self.assertIn("heater", s)
+
+    def test_tg_command_mode(self):
+        self.app._plan = {"phase": "window", "setting": 40}
+        s = self.app._tg_command("/mode")
+        self.assertIn("MANUAL", s)
+        self.assertIn("window", s)
+
+    def test_tg_command_plan_lists_next_window_and_energy(self):
+        now = int(time.time()) - (int(time.time()) % 3600)
+        ts = [now + i * 3600 for i in range(48)]
+        self.app._plan = {
+            "phase": "eco", "setting": 28, "plan_ts": ts,
+            "plan_phase": ["eco"] * 20 + ["window"] * 4 + ["eco"] * 24,
+            "plan_us": [1, 1] + [0] * 46, "energy_kwh": 12.5}
+        s = self.app._tg_command("/plan")
+        self.assertIn("window", s)
+        self.assertIn("12.5", s)
+
+    def test_tg_command_unknown_returns_none(self):
+        self.assertIsNone(self.app._tg_command("/bogus"))
+
     def test_history_window_filtering(self):
         now = int(time.time())
         with self.app._lock:

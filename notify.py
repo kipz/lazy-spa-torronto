@@ -45,6 +45,38 @@ def configured():
     return bool(cfg.get(TOKEN_VAR) and cfg.get(CHAT_VAR))
 
 
+def get_updates(offset=None, timeout=20):
+    """Long-poll Telegram getUpdates. Returns a list of update dicts.
+
+    Used for the two-way bot (``/status``, ``/mode``, ...). Returns [] when
+    the bot isn't configured or the API errors. The chunk stays limited to
+    messages and channel posts so the poller sees commands only.
+    """
+    cfg = load_config()
+    token = cfg.get(TOKEN_VAR)
+    if not token:
+        return []
+    params = {
+        "timeout": str(timeout),
+        "allowed_updates": '["message","channel_post"]',
+    }
+    if offset:
+        params["offset"] = str(offset)
+    url = "https://api.telegram.org/bot%s/getUpdates?%s" % (
+        token, urllib.parse.urlencode(params))
+    try:
+        with urllib.request.urlopen(url, timeout=timeout + 5) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+        return payload.get("result", []) if payload.get("ok") else []
+    except Exception:  # noqa: BLE001 - long-poll must never raise up
+        return []
+
+
+def configured_chat_id():
+    """Return the configured chat id (as a str), or None."""
+    return load_config().get(CHAT_VAR)
+
+
 def send_text(text, chat_id=None):
     """Send ``text`` to the configured chat. Returns ``(ok, error)``."""
     cfg = load_config()

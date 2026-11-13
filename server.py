@@ -207,6 +207,7 @@ class SpaServer:
         self.add_log("info", "Server started in %s mode (window %s, target %d°C)"
                      % (cfg.mode, cfg.scheduler_cfg["WINDOW"],
                         int(cfg.scheduler_cfg["TARGET_TEMP"])))
+        self._telegram_poller()  # two-way bot commands if telegram.env set
 
     # -- state -----------------------------------------------------------
     def update_state(self, state):
@@ -367,6 +368,99 @@ class SpaServer:
                      "Telegram target-reached %s (%s)"
                      % ("sent" if ok else "failed: " + err, phase))
         self._broadcast("log")
+
+    def _tg_command(self, command):
+        """Build a Telegram reply for a bot /command, or None if unknown."""
+        c = (command or "").lower()
+        if c in ("/status", "/s", "/state"):
+            return self._tg_status()
+        if c == "/mode":
+            state, _ = self.get_state()
+            phase = (self._plan or {}).get("phase")
+            setting = (self._plan or {}).get("setting")
+            return ("<b>Torronto</b> mode: <b>%s</b> · phase: %s · target %s°C"
+                    % (self.cfg.mode.upper(), phase or "?", setting or "?"))
+        if c == "/plan":
+            return self._tg_plan()
+        if c in ("/help", "/start"):
+            return ("Commands: <code>/status</code> full state · "
+                    "<code>/mode</code> mode/phase/target · "
+                    "<code>/plan</code> schedule · <code>/help</code> this")
+        return None
+
+    def _tg_status(self):
+        state, _ = self.get_state()
+        cfg = self.cfg.scheduler_cfg
+        phase = (self._plan or {}).get("phase") or "?"
+        setting = (self._plan or {}).get("setting")
+        water = state.get("water_temperature")
+        dev_target = state.get("temperature_setting")
+        heat = heater_status(state)
+        power = state.get("power_state") in (1, "1")
+        filt = state.get("filter_state")
+        lines = [
+            "<b>Torronto</b> \U0001F30A status",
+            "mode: <b>%s</b> · phase: %s" % (self.cfg.mode.upper(), phase),
+            "water: <b>%s°C</b> (device target %s°C)" % (water, dev_target or "?"),
+            "heater: %s · power: %s · filter: %s" % (
+                heat, "on" if power else "off",
+                "running" if filt == 2 else ("on" if filt else "off")),
+            "window: %s · target %s° / eco %s°" % (
+                cfg["WINDOW"], cfg["TARGET_TEMP"], cfg["ECO_TEMP"]),
+        ]
+        if cfg.get("LOCATION"):
+            lines.append("location: %s" % cfg["LOCATION"])
+        return "\n".join(lines)
+
+    def _tg_plan(self):
+        plan = self._plan or {}
+        ts = plan.get("plan_ts") or []
+        phase = plan.get("phase") or []
+        setting = plan.get("setting")
+        nxt = None
+        for i, ph in enumerate(plan.get("plan_phase") or []):
+            if ph == "window" and ts and i < len(ts):
+                nxt = ts[i]
+                break
+        nxt_s = ("%02d:%02d" % (dt.datetime.fromtimestamp(nxt).hour,
+                                dt.datetime.fromtimestamp(nxt).minute)) if nxt else "?"
+        on24 = sum(1 for u in (plan.get("plan_us") or [])[:24] if u)
+        en = plan.get("energy_kwh")
+        return ("<b>Torronto</b> plan\n"
+                "phase: %s · target %s°C\n"
+                "next window: %s\n"
+                "heater ON next 24h: %dh\n"
+                "energy (plan): %s kWh"
+                % (phase or "?", setting or "?",
+                   nxt_s, on24, ("%.1f" % en) if isinstance(en, (int, float)) else "?"))
+
+    def _telegram_poller(self):
+        if not notify.configured():
+            return
+        threading.Thread(target=self._tg_poll_loop, daemon=True).start()
+
+    def _tg_poll_loop(self):
+        chat = notify.configured_chat_id()
+        offset = 0
+        while not self._stopping:
+            try:
+                updates = notify.get_updates(offset)
+            except Exception:
+                updates = []
+            for u in updates:
+                offset = int(u.get("update_id", 0)) + 1
+                msg = u.get("message") or u.get("channel_post")
+                if not msg:
+                    continue
+                text = (msg.get("text") or "").strip()
+                if not text.startswith("/"):
+                    continue
+                if str(msg.get("chat", {}).get("id")) != str(chat):
+                    continue
+                reply = self._tg_command(text.split()[0])
+                if reply:
+                    notify.send_text(reply, chat_id=msg["chat"]["id"])
+            time.sleep(0.4)
 
     def _save_model_ua(self, ua):
         path = os.path.join(BASE_DIR, "scheduler_model.json")

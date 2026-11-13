@@ -107,14 +107,18 @@
             <button class="pill-btn" data-fc-days="7">7d</button>
           </div>
         </div>
+        <div id="nowConditions" class="now-conditions" aria-live="polite"></div>
         <div id="dayCards" class="day-cards" aria-label="daily forecast summary"></div>
         <canvas id="fcChart"></canvas>
         <div class="legend">
-          <span class="lg"><i class="sw fc-amb"></i>ambient forecast</span>
+          <span class="lg"><i class="sw fc-amb"></i>ambient</span>
+          <span class="lg"><i class="sw fc-feels"></i>feels like</span>
           <span class="lg"><i class="sw fc-water"></i>projected water</span>
-          <span class="lg"><i class="sw on"></i>heater ON</span>
+          <span class="lg"><i class="sw fc-heater"></i>heater ON</span>
           <span class="lg"><i class="sw fc-window"></i>use window</span>
           <span class="lg"><i class="sw fc-preheat"></i>preheat</span>
+          <span class="lg"><i class="sw fc-frost"></i>0° frost</span>
+          <span class="lg"><i class="sw fc-precip"></i>precipitation</span>
         </div>
         <p class="hint" id="fcHint">Projection uses the learned cooling rate (UA)
           and today's water temperature — cold snaps pull the preheat earlier.</p>

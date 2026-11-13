@@ -699,18 +699,8 @@ class _Handler(BaseHTTPRequestHandler):
                 days = 3
             days = max(1, min(days, 7))
             try:
-                weather = scheduler.fetch_forecast(app._lat, app._lon,
-                                                   forecast_days=days)
-                now = int(time.time())
-                hour = now - (now % 3600)
-                series = []
-                for _ in range(days * 24):
-                    entry = weather.get(hour)
-                    if entry is None:
-                        break
-                    series.append({"ts": hour, "temp": entry[0]})
-                    hour += 3600
-                self._send_json(200, {"series": series, "days": days})
+                self._send_json(200, scheduler.fetch_weather_detail(
+                    app._lat, app._lon, days))
             except Exception as e:
                 self._send_json(502, {"error": str(e)})
 

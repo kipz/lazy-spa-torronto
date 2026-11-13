@@ -169,10 +169,27 @@ body {
 #fcChart { width: 100%; height: 280px; display: block; border-radius: 12px; margin-top: 4px; }
 #fcChart + .legend { margin-top: 10px; }
 #forecastCard .hint { color: var(--muted); font-size: 12px; margin-top: 10px; line-height: 1.5; }
-.sw.fc-amb { background: var(--warm); height: 3px; border-radius: 0; }
-.sw.fc-water { background: var(--accent); height: 3px; border-radius: 0; }
+.sw.fc-amb { background: #ffb86b; height: 3px; border-radius: 0; }
+.sw.fc-feels { background: repeating-linear-gradient(90deg, #f78fb3 0 3px, transparent 3px 6px); height: 3px; border-radius: 0; }
+.sw.fc-water { background: #4fd1ff; height: 3px; border-radius: 0; }
+.sw.fc-heater { background: rgba(255,107,107,0.55); }
 .sw.fc-window { background: rgba(124,92,255,0.55); }
-.sw.fc-preheat { background: rgba(255,184,107,0.55); }
+.sw.fc-preheat { background: rgba(255,209,102,0.55); }
+.sw.fc-frost { background: repeating-linear-gradient(90deg, #9db4ff 0 3px, transparent 3px 6px); height: 3px; border-radius: 0; }
+.sw.fc-precip { background: rgba(90,169,255,0.55); }
+.now-conditions {
+  display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center;
+  background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px; padding: 10px 14px; margin-bottom: 12px;
+  font-size: 12.5px; color: var(--text);
+}
+.now-conditions b { color: var(--accent); }
+.now-conditions .frost-pill {
+  margin-left: auto; background: rgba(157,180,255,0.18); color: #9db4ff;
+  border: 1px solid rgba(157,180,255,0.4); border-radius: 999px;
+  padding: 2px 9px; font-weight: 800; font-size: 11px;
+}
+.day-precip { display: block; font-size: 11px; color: #7fb0ff; margin-top: 2px; }
 .day-cards { display: flex; gap: 10px; margin: 12px 0 14px; flex-wrap: wrap; }
 .day-card {
   flex: 1 1 110px; min-width: 104px; padding: 10px 12px; border-radius: 12px;

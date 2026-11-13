@@ -319,44 +319,57 @@ function _dayKey(ts) {
 function renderDayCards() {
   const host = $("#dayCards");
   host.innerHTML = "";
-  const ser = state.weather || [];
-  if (ser.length < 2) {
-    host.innerHTML = '<p class="hint">Forecast unavailable.</p>';
-    return;
-  }
-  const byDay = new Map();
-  for (const w of ser) {
-    const k = _dayKey(w.ts);
-    if (!byDay.has(k)) byDay.set(k, { ts: w.ts, temps: [] });
-    if (w.temp != null) byDay.get(k).temps.push(w.temp);
-  }
-  // two passes: compute a global lo/hi so every day's bar shares one scale
-  const dayStats = [];
-  let gLo = Infinity, gHi = -Infinity;
-  for (const { ts, temps } of byDay.values()) {
-    if (!temps.length) continue;
-    const lo = Math.min.apply(null, temps);
-    const hi = Math.max.apply(null, temps);
-    dayStats.push({ ts, lo, hi });
-    gLo = Math.min(gLo, lo); gHi = Math.max(gHi, hi);
-  }
-  const range = Math.max(1, gHi - gLo);
   const DAYS_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   const todayKey = _dayKey(Date.now() / 1000);
+
+  // Prefer the API's daily summary (hi/lo/precipProb/condition); fall back to
+  // grouping hourly points so the UI still works with any payload shape.
+  let days = [];
+  if (state.daily && state.daily.length) {
+    days = state.daily.map((dd, i) => {
+      const d = new Date(Number(dd.date) * 1000);
+      return { ts: Number(dd.date), name: _dayKey(dd.date) === todayKey ? "Today" : DAYS_SHORT[d.getDay()],
+               date: d.getDate() + "/" + (d.getMonth() + 1),
+               hi: dd.hi, lo: dd.lo, emoji: dd.emoji, label: dd.label,
+               precipProb: dd.precipProb };
+    });
+  } else {
+    const ser = state.weather || [];
+    if (ser.length < 2) { host.innerHTML = '<p class="hint">Forecast unavailable.</p>'; return; }
+    const byDay = new Map();
+    for (const w of ser) {
+      const k = _dayKey(w.ts);
+      if (!byDay.has(k)) byDay.set(k, { ts: w.ts, temps: [] });
+      if (w.temp != null) byDay.get(k).temps.push(w.temp);
+    }
+    for (const { ts, temps } of byDay.values()) {
+      const d = new Date(ts * 1000);
+      days.push({ ts, name: _dayKey(ts) === todayKey ? "Today" : DAYS_SHORT[d.getDay()],
+                  date: d.getDate() + "/" + (d.getMonth() + 1),
+                  hi: Math.max.apply(null, temps), lo: Math.min.apply(null, temps),
+                  emoji: "", label: "", precipProb: null });
+    }
+  }
+  if (!days.length) { host.innerHTML = '<p class="hint">Forecast unavailable.</p>'; return; }
+
+  const gLo = Math.min.apply(null, days.map((d) => d.lo));
+  const gHi = Math.max.apply(null, days.map((d) => d.hi));
+  const range = Math.max(1, gHi - gLo);
   let first = true;
-  for (const { ts, lo, hi } of dayStats) {
-    const d = new Date(ts * 1000);
-    const name = _dayKey(ts) === todayKey ? "Today" : DAYS_SHORT[d.getDay()];
-    const left = Math.max(0, Math.min(100, (lo - gLo) / range * 100));
-    const width = Math.max(8, (hi - lo) / range * 100);
+  for (const dd of days) {
+    const left = Math.max(0, Math.min(100, (dd.lo - gLo) / range * 100));
+    const width = Math.max(8, (dd.hi - dd.lo) / range * 100);
     const card = document.createElement("div");
     card.className = "day-card" + (first ? " today" : "");
     first = false;
+    let precip = "";
+    if (dd.precipProb != null)
+      precip = '<span class="day-precip" title="precipitation chance">💧' + dd.precipProb.toFixed(0) + "%</span>";
     card.innerHTML =
-      '<span class="day-name">' + name + "</span>" +
-      '<span class="day-date">' + d.getDate() + "/" + (d.getMonth() + 1) + "</span>" +
+      '<span class="day-name">' + (dd.emoji ? dd.emoji + " " : "") + dd.name + "</span>" +
+      '<span class="day-date">' + dd.date + (dd.label ? " · " + dd.label : "") + "</span>" +
       '<span class="day-bar"><i style="left:' + left + "%;width:" + width + '%"></i></span>' +
-      '<span class="day-temp"><b>' + hi.toFixed(0) + '°</b><span class="day-lo">' + lo.toFixed(0) + "°</span></span>";
+      '<span class="day-temp"><b>' + dd.hi.toFixed(0) + '°</b><span class="day-lo">' + dd.lo.toFixed(0) + "°</span>" + precip + "</span>";
     host.appendChild(card);
   }
 }
@@ -385,10 +398,10 @@ function drawForecastChart() {
   const t0 = weather[0].ts;
   const t1 = weather[weather.length - 1].ts;
   const span = Math.max(1, t1 - t0);
-  const all = weather.filter((w) => w.temp != null).map((w) => w.temp)
+  const vals = weather.flatMap((w) => [w.temp, w.feels]).filter((v) => v != null)
     .concat(plan.plan_water || []).concat(plan.plan_amb || []);
-  let lo = Math.floor(Math.min.apply(null, all) - 2);
-  let hi = Math.ceil(Math.max.apply(null, all) + 2);
+  let lo = Math.floor(Math.min.apply(null, vals) - 2);
+  let hi = Math.ceil(Math.max.apply(null, vals) + 2);
   lo = Math.max(-20, lo); hi = Math.min(45, hi);
 
   const X = (ts) => pad.l + iw * (ts - t0) / span;
@@ -417,49 +430,78 @@ function drawForecastChart() {
 
   const plan_ts = plan.plan_ts;
   const plan_phase = plan.plan_phase || [];
-  const plan_us = plan.plan_us || [];
-  const plan_set = plan.plan_set || [];
   const plan_water = plan.plan_water || [];
 
-  // window / preheat shading
+  // precipitation lane along the bottom of the plot
+  const laneTop = pad.t + ih * 0.88;
+  const hasPrecip = weather.some((w) => w.precipProb != null);
+  if (hasPrecip) {
+    ctx.fillStyle = "rgba(90,169,255,0.5)";
+    for (const w of weather) {
+      const pp = w.precipProb;
+      if (pp == null || pp <= 1) continue;
+      const x0 = X(w.ts), x1 = X(w.ts + 3600);
+      const bh = (Math.min(100, pp) / 100) * (pad.t + ih - laneTop);
+      ctx.fillRect(x0, pad.t + ih - bh, Math.max(1, x1 - x0), bh);
+    }
+    ctx.strokeStyle = "rgba(90,169,255,0.25)";
+    ctx.beginPath(); ctx.moveTo(pad.l, laneTop); ctx.lineTo(W - pad.r, laneTop); ctx.stroke();
+  }
+
+  // window / preheat region shading (behind the heater bands)
   plan_phase.forEach((p, i) => {
     if (p === "eco") return;
     const x0 = X(plan_ts[i]), x1 = X(plan_ts[i] + 3600);
-    ctx.fillStyle = p === "window" ? "rgba(124,92,255,0.16)" : "rgba(255,184,107,0.10)";
+    ctx.fillStyle = p === "window" ? "rgba(124,92,255,0.20)" : "rgba(255,209,102,0.16)";
     ctx.fillRect(x0, pad.t, Math.max(1, x1 - x0), ih);
   });
 
-  // target/eco reference lines
-  if (plan_set.length) {
-    const tgt = plan_set[0];
-    ctx.strokeStyle = "rgba(124,92,255,0.8)";
+  // frost threshold at 0 °C
+  if (lo < 0 && hi > 0) {
+    ctx.strokeStyle = "rgba(157,180,255,0.9)";
     ctx.setLineDash([4, 4]);
-    ctx.beginPath(); ctx.moveTo(pad.l, Y(tgt)); ctx.lineTo(W - pad.r, Y(tgt)); ctx.stroke();
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.l, Y(0)); ctx.lineTo(W - pad.r, Y(0)); ctx.stroke();
     ctx.setLineDash([]);
+    ctx.fillStyle = "#9db4ff";
+    ctx.textAlign = "left";
+    ctx.fillText("0°", pad.l + 4, Y(0) - 3);
   }
 
-  // heater-on bands
-  if (plan_us.length) {
-    ctx.fillStyle = "rgba(255,107,107,0.14)";
-    for (let i = 0; i < plan_us.length; i++) {
-      if (!plan_us[i]) continue;
+  // heater-on bands (clearly visible, drawn on top of the shading)
+  if ((plan.plan_us || []).length) {
+    ctx.fillStyle = "rgba(255,107,107,0.30)";
+    plan.plan_us.forEach((u, i) => {
+      if (!u) return;
       const x0 = X(plan_ts[i]), x1 = X(plan_ts[i] + 3600);
       ctx.fillRect(x0, pad.t, Math.max(1, x1 - x0), ih);
-    }
+    });
   }
 
-  // ambient forecast line (full span)
-  const ambPts = weather.filter((w) => w.temp != null);
-  if (ambPts.length > 1) {
+  // ambient forecast line
+  const amb = weather.filter((w) => w.temp != null);
+  if (amb.length > 1) {
     ctx.strokeStyle = "#ffb86b";
     ctx.lineWidth = 1.5;
     ctx.beginPath();
-    ambPts.forEach((p, i) => (i ? ctx.lineTo(X(p.ts), Y(p.temp)) : ctx.moveTo(X(p.ts), Y(p.temp))));
+    amb.forEach((p, i) => (i ? ctx.lineTo(X(p.ts), Y(p.temp)) : ctx.moveTo(X(p.ts), Y(p.temp))));
     ctx.stroke();
   }
 
+  // feels-like dashed line
+  const feels = weather.filter((w) => w.feels != null);
+  if (feels.length > 1) {
+    ctx.strokeStyle = "#f78fb3";
+    ctx.lineWidth = 1.2;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    feels.forEach((p, i) => (i ? ctx.lineTo(X(p.ts), Y(p.feels)) : ctx.moveTo(X(p.ts), Y(p.feels))));
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
   // projected water line (plan horizon)
-  if (plan_water.length && plan_water.length >= plan_ts.length) {
+  if (plan_water.length >= plan_ts.length) {
     ctx.strokeStyle = "#4fd1ff";
     ctx.lineWidth = 2.5;
     ctx.lineJoin = "round";
@@ -564,11 +606,36 @@ function refreshFacts() {
     $("#factAmb").textContent = (state.plan.ambient_now != null ? state.plan.ambient_now.toFixed(1) : "—") + "°";
     $("#factEnergy").textContent = state.plan.energy_kwh != null ? state.plan.energy_kwh.toFixed(1) + " kWh" : "—";
   }
-  if (state.weather.length) {
+  const cur = state.current;
+  if (cur && cur.temp != null) {
+    $("#factWeather").textContent = cur.temp.toFixed(0)
+      + "°" + (cur.label ? " " + cur.emoji : "");
+  } else if (state.weather.length) {
     const lo = Math.min.apply(null, state.weather.map((w) => w.temp));
     const hi = Math.max.apply(null, state.weather.map((w) => w.temp));
     $("#factWeather").textContent = lo.toFixed(0) + "…" + hi.toFixed(0) + "°";
   }
+  renderNowConditions();
+}
+
+function renderNowConditions() {
+  const host = $("#nowConditions");
+  if (!host) return;
+  const cur = state.current;
+  if (!cur || cur.temp == null) { host.textContent = ""; return; }
+  const items = [];
+  items.push(cur.emoji + " " + (cur.label || "unknown"));
+  items.push(cur.temp.toFixed(0) + "° air");
+  if (cur.feels != null && Math.abs(cur.feels - cur.temp) >= 0.5)
+    items.push("<b>feels " + cur.feels.toFixed(0) + "°</b>");
+  if (cur.dew != null) items.push("dew " + cur.dew.toFixed(0) + "°");
+  if (cur.humidity != null) items.push(cur.humidity.toFixed(0) + "% humidity");
+  if (cur.wind != null) items.push("wind " + cur.wind.toFixed(1) + " m/s");
+  if (cur.pressure != null) items.push(Math.round(cur.pressure) + " hPa");
+  if (cur.cloud != null) items.push(cur.cloud.toFixed(0) + "% cloud");
+  const frost = (cur.dew != null && cur.dew <= 0) || (cur.feels != null && cur.feels <= 0);
+  const pill = frost ? "<span class='frost-pill'>🧊 frost risk</span>" : "";
+  host.innerHTML = "Now: <span class='now-cats'>" + items.join(" · ") + "</span>" + pill;
 }
 
 function renderPlanStrip() {
@@ -915,7 +982,9 @@ async function loadPlan() {
 async function loadWeather() {
   try {
     const d = await api("/api/weather?days=" + state.fcDays);
-    state.weather = d.series || [];
+    state.weather = d.hourly || [];
+    state.current = d.current || null;
+    state.daily = d.daily || [];
     refreshFacts();
     renderForecast();
   } catch (e) { /* ignore */ }

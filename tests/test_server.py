@@ -525,18 +525,27 @@ class TestAPIEndpoints(unittest.TestCase):
     def test_weather_endpoint_multi_day(self):
         import urllib.request
         hour0 = int(time.time()) - (int(time.time()) % 3600)
-        payload = {}
-        for i in range(7 * 24):
-            payload[hour0 + i * 3600] = (4.0 + (i % 6), 1.0, 0.0)
-        with mock.patch.object(server.scheduler, "fetch_forecast",
+        payload = {
+            "days": 7,
+            "current": {"temp": 4.0, "feels": 2.0, "humidity": 80, "label": "Clear",
+                        "emoji": "☀️", "dew": 0.0, "wind": 1.0},
+            "hourly": [{"ts": hour0 + i * 3600, "temp": 4.0 + (i % 6), "feels": 2.0,
+                        "precipProb": (i % 4) * 25, "code": 0, "label": "Clear", "emoji": "☀️"}
+                       for i in range(7 * 24)],
+            "daily": [{"date": hour0 + i * 86400, "hi": 8.0, "lo": 2.0,
+                       "precipProb": 20, "label": "Clear", "emoji": "☀️"}
+                      for i in range(7)],
+        }
+        with mock.patch.object(server.scheduler, "fetch_weather_detail",
                                return_value=payload):
             req = urllib.request.Request(
                 "http://127.0.0.1:%d/api/weather?days=7" % self.port)
             with urllib.request.urlopen(req, timeout=10) as r:
                 d = json.loads(r.read())
         self.assertEqual(d["days"], 7)
-        self.assertGreaterEqual(len(d["series"]), 7 * 24 - 1)
-        self.assertEqual(d["series"][0]["temp"], 4.0)
+        self.assertGreaterEqual(len(d["hourly"]), 7 * 24 - 1)
+        self.assertEqual(d["current"]["temp"], 4.0)
+        self.assertGreaterEqual(len(d["daily"]), 7)
 
 
 if __name__ == "__main__":

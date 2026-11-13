@@ -63,13 +63,33 @@ DEFAULTS = {
     "UA_KW_PER_C": 0.03,            # initial guess; calibration overwrites
     "WIND_SENSITIVITY": 0.0,        # UA scaling per m/s wind (0 = ignore)
     "SOLAR_GAIN_KW": 0.0,           # peak kW absorbed from sun on cover
-    "HORIZON_H": 48,                # planning horizon (hours)
+    "HORIZON_H": 168,               # planning horizon (hours) == 7-day forecast
     "STEP_H": 1.0,                  # control timestep (hours)
     "LOG_FILE": "scheduler.log",
 }
 
 HOUR = 3600.0
 EPS = 1e-6
+
+# WMO weather code -> (label, emoji)
+WMO_TEXT = {
+    0: ("Clear", "☀️"), 1: ("Mostly clear", "🌤"), 2: ("Partly cloudy", "⛅"),
+    3: ("Overcast", "☁️"), 45: ("Fog", "🌫"), 48: ("Rime fog", "🌫"),
+    51: ("Light drizzle", "🌦"), 53: ("Drizzle", "🌦"), 55: ("Drizzle", "🌧"),
+    56: ("Freezing drizzle", "🌧"), 57: ("Freezing drizzle", "🌧"),
+    61: ("Light rain", "🌧"), 63: ("Rain", "🌧"), 65: ("Heavy rain", "🌧"),
+    66: ("Freezing rain", "🌧"), 67: ("Freezing rain", "🌧"),
+    71: ("Light snow", "🌨"), 73: ("Snow", "🌨"), 75: ("Heavy snow", "❄️"),
+    77: ("Snow grains", "🌨"),
+    80: ("Light showers", "🌦"), 81: ("Showers", "🌧"), 82: ("Heavy showers", "🌧"),
+    85: ("Snow showers", "🌨"), 86: ("Heavy snow showers", "❄️"),
+    95: ("Thunderstorm", "⛈"), 96: ("Thunder + hail", "⛈"), 99: ("Thunder + hail", "⛈"),
+}
+
+
+def weather_condition(code):
+    """Return (label, emoji) for a WMO weather code."""
+    return WMO_TEXT.get(int(code or 0), ("Unknown", "🌡"))
 
 
 # --- tiny stdlib HTTP helpers -------------------------------------------------
@@ -218,6 +238,65 @@ def fetch_forecast(lat, lon, past_days=0, forecast_days=3):
             sw[i] if i < len(sw) and sw[i] is not None else 0.0,
         )
     return out
+
+
+def fetch_weather_detail(lat, lon, days=7):
+    """Rich weather for the web UI: current + hourly + daily summaries."""
+    res = http_get_json(FORECAST_URL, {
+        "latitude": lat, "longitude": lon,
+        "current": ("temperature_2m,apparent_temperature,relative_humidity_2m,"
+                    "dew_point_2m,precipitation,weather_code,wind_speed_10m,"
+                    "wind_direction_10m,surface_pressure,cloud_cover,is_day"),
+        "hourly": ("temperature_2m,apparent_temperature,dew_point_2m,"
+                   "relative_humidity_2m,precipitation_probability,precipitation,"
+                   "rain,snowfall,weather_code,wind_speed_10m,wind_gusts_10m,"
+                   "wind_direction_10m,cloud_cover,surface_pressure,"
+                   "shortwave_radiation,is_day"),
+        "daily": ("weather_code,temperature_2m_max,temperature_2m_min,"
+                  "apparent_temperature_max,precipitation_probability_max,"
+                  "precipitation_sum,wind_speed_10m_max"),
+        "forecast_days": int(days), "timezone": "auto", "timeformat": "unixtime",
+        "wind_speed_unit": "ms",
+    })
+    hourly = []
+    h = res.get("hourly") or {}
+    n = len(h.get("time", []))
+    for i in range(n):
+        ts = int(h["time"][i])
+        label, emoji = weather_condition(h["weather_code"][i])
+        hourly.append({
+            "ts": ts - (ts % 3600), "temp": h["temperature_2m"][i],
+            "feels": h["apparent_temperature"][i], "dew": h["dew_point_2m"][i],
+            "humidity": h["relative_humidity_2m"][i],
+            "precipProb": h["precipitation_probability"][i],
+            "precip": h["precipitation"][i], "rain": h["rain"][i],
+            "snowfall": h["snowfall"][i], "wind": h["wind_speed_10m"][i],
+            "gust": h["wind_gusts_10m"][i], "windDir": h["wind_direction_10m"][i],
+            "cloud": h["cloud_cover"][i], "pressure": h["surface_pressure"][i],
+            "sw": h["shortwave_radiation"][i], "isDay": h["is_day"][i],
+            "code": h["weather_code"][i], "label": label, "emoji": emoji,
+        })
+    daily = []
+    dd = res.get("daily") or {}
+    for i in range(len(dd.get("time", []))):
+        label, emoji = weather_condition(dd["weather_code"][i])
+        daily.append({"date": dd["time"][i], "code": dd["weather_code"][i],
+                      "label": label, "emoji": emoji, "hi": dd["temperature_2m_max"][i],
+                      "lo": dd["temperature_2m_min"][i],
+                      "feelsHi": dd["apparent_temperature_max"][i],
+                      "precipProb": dd["precipitation_probability_max"][i],
+                      "precip": dd["precipitation_sum"][i],
+                      "wind": dd["wind_speed_10m_max"][i]})
+    c = res.get("current") or {}
+    label, emoji = weather_condition(c.get("weather_code"))
+    current = {"ts": c.get("time"), "temp": c.get("temperature_2m"),
+               "feels": c.get("apparent_temperature"), "dew": c.get("dew_point_2m"),
+               "humidity": c.get("relative_humidity_2m"), "wind": c.get("wind_speed_10m"),
+               "windDir": c.get("wind_direction_10m"), "pressure": c.get("surface_pressure"),
+               "cloud": c.get("cloud_cover"), "precip": c.get("precipitation"),
+               "isDay": c.get("is_day"), "code": c.get("weather_code"),
+               "label": label, "emoji": emoji}
+    return {"current": current, "hourly": hourly, "daily": daily, "days": days}
 
 
 def forecast_series(cfg, weather, now):
@@ -546,7 +625,8 @@ def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True):
     CLI `run` loop and the web server's scheduler thread.
     """
     import spa  # reuses auth/command machinery
-    weather = fetch_forecast(lat, lon)
+    horizon_days = max(3, (int(cfg["HORIZON_H"]) + 23) // 24)
+    weather = fetch_forecast(lat, lon, forecast_days=horizon_days)
     t0 = time.time()
     series = forecast_series(cfg, weather, t0)
     if state is None:

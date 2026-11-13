@@ -124,6 +124,52 @@ class TestWeather(unittest.TestCase):
         series = scheduler.forecast_series(cfg, weather, ts_at(0))
         self.assertEqual(series[0], (ts_at(0), cfg["ECO_TEMP"]))
 
+    def test_weather_condition_maps_wmo(self):
+        self.assertEqual(scheduler.weather_condition(0), ("Clear", "☀️"))
+        self.assertEqual(scheduler.weather_condition(63), ("Rain", "🌧"))
+        self.assertEqual(scheduler.weather_condition(71), ("Light snow", "🌨"))
+        self.assertEqual(scheduler.weather_condition(999), ("Unknown", "🌡"))
+
+    def test_fetch_weather_detail_parses_rich_payload(self):
+        base = ts_at(0)
+        payload = {
+            "current": {"time": base, "temperature_2m": 3.0, "apparent_temperature": -0.1,
+                        "relative_humidity_2m": 76, "dew_point_2m": -0.8,
+                        "precipitation": 0.0, "weather_code": 1,
+                        "wind_speed_10m": 1.6, "wind_direction_10m": 10,
+                        "surface_pressure": 1011.7, "cloud_cover": 0, "is_day": 0},
+            "hourly": {
+                "time": [base + i * 3600 for i in range(3)],
+                "temperature_2m": [3.0, 2.4, 2.1],
+                "apparent_temperature": [-0.1, -1.0, -1.2],
+                "dew_point_2m": [-0.8, -1.5, -1.9],
+                "relative_humidity_2m": [76, 80, 82],
+                "precipitation_probability": [0, 10, 40],
+                "precipitation": [0.0, 0.0, 0.1], "rain": [0.0, 0.0, 0.1],
+                "snowfall": [0.0, 0.0, 0.0], "weather_code": [1, 2, 3],
+                "wind_speed_10m": [1.6, 2.0, 3.1], "wind_gusts_10m": [3.9, 4.0, 5.2],
+                "wind_direction_10m": [10, 20, 30], "cloud_cover": [0, 40, 90],
+                "surface_pressure": [1011.7, 1010, 1008], "shortwave_radiation": [0, 0, 50],
+                "is_day": [0, 0, 1],
+            },
+            "daily": {"time": [base, base + 86400], "weather_code": [1, 63],
+                      "temperature_2m_max": [7.7, 6.0], "temperature_2m_min": [-0.1, 1.0],
+                      "apparent_temperature_max": [4.7, 3.0],
+                      "precipitation_probability_max": [0, 60],
+                      "precipitation_sum": [0.0, 2.0], "wind_speed_10m_max": [1.7, 4.0]},
+        }
+        with mock.patch.object(scheduler, "http_get_json", return_value=payload):
+            out = scheduler.fetch_weather_detail(51.5, -0.12, 2)
+        self.assertEqual(out["days"], 2)
+        self.assertEqual(len(out["hourly"]), 3)
+        self.assertEqual(out["hourly"][1]["precipProb"], 10)
+        self.assertEqual(out["hourly"][2]["label"], "Overcast")
+        self.assertEqual(out["current"]["temp"], 3.0)
+        self.assertEqual(out["current"]["feels"], -0.1)
+        self.assertEqual(out["current"]["label"], "Mostly clear")
+        self.assertEqual(out["daily"][1]["precipProb"], 60)
+        self.assertEqual(out["daily"][1]["label"], "Rain")
+
     def test_fetch_forecast_parses_hourly(self):
         payload = {
             "hourly": {

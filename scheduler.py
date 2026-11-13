@@ -71,6 +71,12 @@ DEFAULTS = {
 HOUR = 3600.0
 EPS = 1e-6
 
+# In AUTO ECO phase the scheduler lets the tub coast down so the server's
+# cooling-rate (UA) sampler can measure real heat loss. To avoid short-cycling
+# the heater around the ECO boundary we only force the heater off once the
+# water is clearly above the ECO setpoint, not right on it.
+ECO_COAST_MARGIN = 1.5
+
 # WMO weather code -> (label, emoji)
 WMO_TEXT = {
     0: ("Clear", "☀️"), 1: ("Mostly clear", "🌤"), 2: ("Partly cloudy", "⛅"),
@@ -598,6 +604,31 @@ def hot_phase_now(series, us, windows):
     return "eco"
 
 
+def desired_heater_command(cfg, phase, setting, water):
+    """Decide the heater_state command for one scheduler step, or None.
+
+    Returns None (no heater command - leave the spa thermostat in charge),
+    1 (heater on) or 0 (heater off). In AUTO mode the controller primarily
+    drives temperature_setting and only touches heater_state when it must:
+
+      * window/preheat: ensure heat is on so the tub reaches and holds target;
+      * eco with the water clearly above the ECO setting: command the heater
+        OFF so the tub genuinely coasts down (which lets the server's UA
+        sampler measure heat loss - the tub never cools otherwise);
+      * freeze protection: never command the heater off while the water is at
+        or below FLOOR_TEMP.
+    """
+    if phase != "eco":
+        return 1
+    if not isinstance(water, (int, float)):
+        return None          # unknown water temp: let the thermostat govern
+    if water <= float(cfg["FLOOR_TEMP"]):
+        return 1             # freeze protection must stay heated
+    if water >= float(setting) + ECO_COAST_MARGIN:
+        return 0             # clearly above ECO: force a coast-down
+    return None              # near/at ECO: thermostat holds it without commands
+
+
 def phase_series(series, us, windows):
     """Classify every plan hour: window / preheat / eco (see hot_phase_now)."""
     n = len(series)
@@ -651,9 +682,18 @@ def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True):
         if int(state.get("temperature_setting") or 0) != setting:
             spa.send_command(tokens, "temperature_setting", setting)
             changed = True
-        if not state.get("heater_state"):
-            spa.send_command(tokens, "heater_state", 1)
-            changed = True
+        # Heat command: keep heat on during window/preheat, and in ECO force
+        # the heater off (only when water is clearly above the ECO setpoint,
+        # never at/below FLOOR_TEMP) so the tub genuinely coasts down and the
+        # UA sampler can measure cooling rate. Only sends on a state change.
+        heat_cmd = desired_heater_command(cfg, phase, setting, T0)
+        cur_heat = int(state.get("heater_state") or 0)
+        if heat_cmd is not None:
+            cur_on = cur_heat != 0
+            want_on = heat_cmd != 0
+            if cur_on != want_on:
+                spa.send_command(tokens, "heater_state", 1 if want_on else 0)
+                changed = True
         if int(state.get("filter_state") or 0) == 0:
             spa.send_command(tokens, "filter_state", 1)
             changed = True
@@ -680,6 +720,10 @@ def run_controller(cfg, lat, lon, dry_run=False):
     Controls temperature_setting (TARGET during use windows / preheat, ECO
     otherwise) and lets the spa's own thermostat run the heater -- switching
     the setpoint is gentler and more accurate than toggling heater_state.
+    The one exception: in ECO the scheduler commands the heater off when the
+    water is clearly above the ECO setpoint so the tub really cools (the
+    server's UA sampler needs genuine coast-downs). See
+    scheduler.desired_heater_command for the safety rules (frost protection).
     """
     tokens = None if dry_run else __import__("spa").get_tokens()
     log_path = os.path.join(BASE_DIR, cfg["LOG_FILE"])

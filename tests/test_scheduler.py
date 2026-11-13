@@ -492,6 +492,74 @@ class TestSchedulerStep(unittest.TestCase):
                 self.assertEqual(res["plan_set"][i], 40, ts)
                 self.assertEqual(res["plan_phase"][i], "window")
 
+    def test_eco_sends_heater_off_when_water_above_eco(self):
+        # AUTO ECO: water is clearly above the ECO setpoint -> schedule the
+        # heater OFF so the tub genuinely coasts down (and UA can be measured).
+        cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28, FLOOR_TEMP=8)
+        state = {"water_temperature": 35, "power_state": 1,
+                 "temperature_setting": 28, "heater_state": 4, "filter_state": 2}
+        mock_spa = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"spa": mock_spa}), \
+             mock.patch.object(scheduler.time, "time", return_value=ts_at(1)), \
+             mock.patch.object(scheduler, "fetch_forecast",
+                               return_value=self._mock_weather()):
+            res = scheduler.scheduler_step(cfg, 51.5, -0.12, state=state, apply=True)
+        self.assertEqual(res["phase"], "eco")
+        self.assertTrue(res["changed"])
+        calls = [c[0] for c in mock_spa.send_command.call_args_list]
+        calls = [(dp, v) for _, dp, v in calls]
+        self.assertIn(("heater_state", 0), calls)
+
+    def test_heater_turned_back_on_in_window(self):
+        # Inside a use window the scheduler must re-engage heat, even if the
+        # ECO coast-down had left the heater off.
+        cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28, FLOOR_TEMP=8)
+        state = {"water_temperature": 39, "power_state": 1,
+                 "temperature_setting": 28, "heater_state": 0, "filter_state": 2}
+        mock_spa = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"spa": mock_spa}), \
+             mock.patch.object(scheduler.time, "time", return_value=ts_at(18)), \
+             mock.patch.object(scheduler, "fetch_forecast",
+                               return_value=self._mock_weather()):
+            res = scheduler.scheduler_step(cfg, 51.5, -0.12, state=state, apply=True)
+        self.assertEqual(res["phase"], "window")
+        calls = [c[0] for c in mock_spa.send_command.call_args_list]
+        calls = [(dp, v) for _, dp, v in calls]
+        self.assertIn(("heater_state", 1), calls)
+
+    def test_freeze_protection_never_sends_heater_off(self):
+        # Water at/below FLOOR_TEMP: heat must stay available (never sent off).
+        cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28, FLOOR_TEMP=8)
+        state = {"water_temperature": 8, "power_state": 1,
+                 "temperature_setting": 28, "heater_state": 0, "filter_state": 2}
+        mock_spa = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"spa": mock_spa}), \
+             mock.patch.object(scheduler.time, "time", return_value=ts_at(1)), \
+             mock.patch.object(scheduler, "fetch_forecast",
+                               return_value=self._mock_weather()):
+            res = scheduler.scheduler_step(cfg, 51.5, -0.12, state=state, apply=True)
+        calls = [c[0] for c in mock_spa.send_command.call_args_list]
+        calls = [(dp, v) for _, dp, v in calls]
+        # heater off must never be sent while the water is at/below FLOOR_TEMP
+        self.assertNotIn(("heater_state", 0), calls)
+        # freeze protection actively keeps heat on when the heater is off
+        self.assertIn(("heater_state", 1), calls)
+
+    def test_eco_cooling_commands_are_idempotent(self):
+        # When everything already matches the plan, scheduler_step sends nothing
+        # (commands only on change), including the ECO heat-off.
+        cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28, FLOOR_TEMP=8)
+        state = {"water_temperature": 35, "power_state": 1,
+                 "temperature_setting": 28, "heater_state": 0, "filter_state": 2}
+        mock_spa = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"spa": mock_spa}), \
+             mock.patch.object(scheduler.time, "time", return_value=ts_at(1)), \
+             mock.patch.object(scheduler, "fetch_forecast",
+                               return_value=self._mock_weather()):
+            res = scheduler.scheduler_step(cfg, 51.5, -0.12, state=state, apply=True)
+        self.assertFalse(res["changed"])
+        mock_spa.send_command.assert_not_called()
+
 
 class TestPhaseSeries(unittest.TestCase):
     def test_classifies_window_preheat_eco(self):
@@ -519,6 +587,41 @@ class TestPhaseSeries(unittest.TestCase):
         phases = scheduler.phase_series(series, us, windows)
         for i in range(14, 17):
             self.assertEqual(phases[i], "eco")  # heater stops before the window
+
+
+class TestDesiredHeaterCommand(unittest.TestCase):
+    def _cfg(self):
+        return make_cfg(TARGET_TEMP=40, ECO_TEMP=28, FLOOR_TEMP=8)
+
+    def test_window_preheat_requests_heat_on(self):
+        for phase in ("window", "preheat"):
+            self.assertEqual(scheduler.desired_heater_command(
+                self._cfg(), phase, 40, 39), 1)
+
+    def test_eco_clearly_above_setpoint_requests_off(self):
+        # water >= eco + ECO_COAST_MARGIN -> command heater off to coast down
+        self.assertEqual(scheduler.desired_heater_command(
+            self._cfg(), "eco", 28, 30), 0)
+        self.assertEqual(scheduler.desired_heater_command(
+            self._cfg(), "eco", 28, 35), 0)
+
+    def test_eco_near_setpoint_leaves_thermostat_alone(self):
+        # within ECO_COAST_MARGIN of the setpoint: no heater command (avoid
+        # short-cycling around the boundary)
+        self.assertIsNone(scheduler.desired_heater_command(
+            self._cfg(), "eco", 28, 29))
+        self.assertIsNone(scheduler.desired_heater_command(
+            self._cfg(), "eco", 28, 27))
+
+    def test_freeze_protection_never_off_at_or_below_floor(self):
+        for water in (8, 5, 0):
+            self.assertEqual(scheduler.desired_heater_command(
+                self._cfg(), "eco", 28, water), 1,
+                msg="water %s must keep heat on" % water)
+
+    def test_unknown_water_leaves_thermostat_alone(self):
+        self.assertIsNone(scheduler.desired_heater_command(
+            self._cfg(), "eco", 28, None))
 
 
 if __name__ == "__main__":

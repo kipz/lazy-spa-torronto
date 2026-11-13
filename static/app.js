@@ -181,6 +181,60 @@ function setGauge(temp) {
 }
 
 /* ---------------- chart ---------------- */
+// Smooth, monotone cubic (Fritsch–Carlson Hermite) spline. Points stay
+// strictly between the data values, so the projected water can't overshoot
+// above its actual maximum. Endcap tangents use the first/last segment slope
+// so the line never spikes at the ends.
+function drawSmoothPath(ctx, pts, X, Y) {
+  ctx.beginPath();
+  if (!pts || !pts.length) return;
+  if (pts.length === 1) { ctx.moveTo(X(pts[0]), Y(pts[0])); return; }
+  const n = pts.length;
+  const x = new Array(n), y = new Array(n);
+  for (let i = 0; i < n; i++) { x[i] = X(pts[i]); y[i] = Y(pts[i]); }
+  ctx.moveTo(x[0], y[0]);
+  if (n === 2) { ctx.lineTo(x[1], y[1]); return; }
+
+  const h = new Array(n - 1), d = new Array(n - 1);
+  for (let i = 0; i < n - 1; i++) {
+    h[i] = x[i + 1] - x[i];
+    d[i] = h[i] !== 0 ? (y[i + 1] - y[i]) / h[i] : 0;
+  }
+  const m = new Array(n).fill(0);
+  m[0] = d[0];
+  m[n - 1] = d[n - 2];
+  for (let i = 1; i < n - 1; i++) {
+    if (d[i - 1] * d[i] <= 0) { m[i] = 0; }
+    else {
+      const w1 = 2 * h[i] + h[i - 1];
+      const w2 = h[i] + 2 * h[i - 1];
+      m[i] = (w1 + w2) ? (w1 * d[i - 1] + w2 * d[i]) / (w1 + w2) : 0;
+    }
+  }
+  // Fritsch–Carlson monotonicity clamp: bounds segment derivatives so the
+  // spline never rolls back or overshoots past the local data.
+  for (let i = 0; i < n - 1; i++) {
+    if (m[i] * m[i + 1] < 0) continue;
+    const r = d[i];
+    if (r === 0) { m[i] = 0; m[i + 1] = 0; continue; }
+    const a = m[i] / r, b = m[i + 1] / r;
+    const s = a * a + b * b;
+    if (s > 9) {
+      const t = 3 / Math.sqrt(s);
+      m[i] = t * a * r;
+      m[i + 1] = t * b * r;
+    }
+  }
+  for (let i = 0; i < n - 1; i++) {
+    const h3 = h[i] / 3;
+    ctx.bezierCurveTo(
+      x[i] + h3,        y[i] + m[i] * h3,
+      x[i + 1] - h3,    y[i + 1] - m[i + 1] * h3,
+      x[i + 1],         y[i + 1]
+    );
+  }
+}
+
 function drawChart() {
   const cv = $("#chart");
   const dpr = window.devicePixelRatio || 1;
@@ -205,10 +259,20 @@ function drawChart() {
   const pts = ser.filter((p) => p.ts >= from && p.water != null);
   if (!pts.length) return;
 
-  const all = pts.map((p) => p.water).concat(pts.filter((p) => p.ambient != null).map((p) => p.ambient));
-  let lo = Math.floor(Math.min.apply(null, all) - 2);
-  let hi = Math.ceil(Math.max.apply(null, all) + 2);
-  lo = Math.max(0, lo); hi = Math.min(45, hi);
+  // Scale primarily to the WATER temperature (ambient is a secondary line that
+  // may extend below the plot). Water is reported at whole-degree resolution in
+  // a narrow ~38-40°C band, so a padded 0..45 axis would crush it into a few px.
+  const waterVals = pts.map((p) => p.water);
+  const ambVals = pts.filter((p) => p.ambient != null).map((p) => p.ambient);
+  const scaled = waterVals.length ? waterVals : ambVals;
+  const minV = scaled.reduce((a, b) => (b < a ? b : a));
+  const maxV = scaled.reduce((a, b) => (b > a ? b : a));
+  let lo = Math.floor(minV - 0.5);
+  let hi = Math.ceil(maxV + 0.5);
+  if (hi - lo < 1) hi = lo + 1;
+  // Sane guard rails only kick in if the real data strays off-panel.
+  lo = Math.max(0, lo);
+  hi = Math.min(45, hi);
 
   const X = (ts) => pad.l + iw * (1 - (now - ts) / (state.range * 3600));
   const Y = (t) => pad.t + ih * (1 - (t - lo) / (hi - lo));
@@ -260,22 +324,20 @@ function drawChart() {
     flush();
   }
 
-  // ambient line
+  // ambient line (secondary; may extend below the plot, that's fine)
   const amb = pts.filter((p) => p.ambient != null);
   if (amb.length > 1) {
     ctx.strokeStyle = "#ffb86b";
     ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    amb.forEach((p, i) => (i ? ctx.lineTo(X(p.ts), Y(p.ambient)) : ctx.moveTo(X(p.ts), Y(p.ambient))));
+    drawSmoothPath(ctx, amb, (p) => X(p.ts), (p) => Y(p.ambient));
     ctx.stroke();
   }
 
-  // water line + fill
+  // water line + fill (smooth monotone cubic over the whole-degree samples)
   ctx.strokeStyle = "#4fd1ff";
   ctx.lineWidth = 2.5;
   ctx.lineJoin = "round";
-  ctx.beginPath();
-  pts.forEach((p, i) => (i ? ctx.lineTo(X(p.ts), Y(p.water)) : ctx.moveTo(X(p.ts), Y(p.water))));
+  drawSmoothPath(ctx, pts, (p) => X(p.ts), (p) => Y(p.water));
   ctx.stroke();
   // gradient fill
   const grad = ctx.createLinearGradient(0, pad.t, 0, pad.t + ih);
@@ -514,8 +576,7 @@ function drawForecastChart() {
   if (amb.length > 1) {
     ctx.strokeStyle = "#ffb86b";
     ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    amb.forEach((p, i) => (i ? ctx.lineTo(X(p.ts), Y(p.temp)) : ctx.moveTo(X(p.ts), Y(p.temp))));
+    drawSmoothPath(ctx, amb, (p) => X(p.ts), (p) => Y(p.temp));
     ctx.stroke();
   }
 
@@ -525,20 +586,23 @@ function drawForecastChart() {
     ctx.strokeStyle = "#f78fb3";
     ctx.lineWidth = 1.2;
     ctx.setLineDash([3, 3]);
-    ctx.beginPath();
-    feels.forEach((p, i) => (i ? ctx.lineTo(X(p.ts), Y(p.feels)) : ctx.moveTo(X(p.ts), Y(p.feels))));
+    drawSmoothPath(ctx, feels, (p) => X(p.ts), (p) => Y(p.feels));
     ctx.stroke();
     ctx.setLineDash([]);
   }
 
-  // projected water line (plan horizon)
+  // projected water line (plan horizon) — smooth monotone cubic so it stays
+  // clamped and never overshoots above the 40°C band beyond the data itself.
   if (plan_water.length >= plan_ts.length) {
-    ctx.strokeStyle = "#4fd1ff";
-    ctx.lineWidth = 2.5;
-    ctx.lineJoin = "round";
-    ctx.beginPath();
-    plan_water.forEach((v, i) => (i ? ctx.lineTo(X(plan_ts[i]), Y(v)) : ctx.moveTo(X(plan_ts[i]), Y(v))));
-    ctx.stroke();
+    const wpts = [];
+    for (let i = 0; i < plan_ts.length; i++) if (plan_water[i] != null) wpts.push(i);
+    if (wpts.length) {
+      ctx.strokeStyle = "#4fd1ff";
+      ctx.lineWidth = 2.5;
+      ctx.lineJoin = "round";
+      drawSmoothPath(ctx, wpts, (i) => X(plan_ts[i]), (i) => Y(plan_water[i]));
+      ctx.stroke();
+    }
   }
 
   // preheat-start markers: show how the forecast shifts the preheat timing

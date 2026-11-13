@@ -37,6 +37,14 @@ class TestHeaterStatus(unittest.TestCase):
                    "heater_state": 4, "power_state": 1})
         self.assertEqual(server.heater_status(st), "cooling")
 
+    def test_heater_off_coastdown_is_cooling(self):
+        # After scheduler_step commands the heater off in ECO, the shadow shows
+        # heater_state 0: the UI must still read "cooling", not "idle"/"off".
+        st = _shadow()
+        st.update({"water_temperature": 40, "temperature_setting": 28,
+                   "heater_state": 0, "power_state": 1})
+        self.assertEqual(server.heater_status(st), "cooling")
+
     def test_window_hold_is_holding(self):
         st = _shadow()
         st.update({"water_temperature": 40, "temperature_setting": 40,
@@ -174,6 +182,24 @@ class TestSpaServer(unittest.TestCase):
                 "water_temperature": 37, "temperature_setting": 40,
                 "power_state": 1, "heater_state": 2})
         self.assertEqual(self.app._ua_samples, [])
+
+    def test_ua_anchor_ambient_captured_at_anchor_time(self):
+        # The anchor's ambient is stored on the anchor itself, so the sampler
+        # must still produce a sample even after the forecast cache stops
+        # covering the older hour (e.g. a replan drops it).
+        base = 1_800_000_000
+        self.app._amb = {base: 5.0}                     # only the anchor hour
+        clock = {"now": base}
+        with mock.patch.object(server.time, "time", lambda: clock["now"]):
+            self.app._maybe_sample_ua({
+                "water_temperature": 38.0, "temperature_setting": 28,
+                "power_state": 1, "heater_state": 0})    # anchor at +0h
+            clock["now"] = base + 7200
+            self.app._amb = {}                           # cache gone after replan
+            self.app._maybe_sample_ua({
+                "water_temperature": 36.6, "temperature_setting": 28,
+                "power_state": 1, "heater_state": 0})    # cooled ~1.4C in 2h
+        self.assertEqual(len(self.app._ua_samples), 1)
 
     def test_history_window_filtering(self):
         now = int(time.time())

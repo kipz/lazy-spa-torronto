@@ -131,6 +131,28 @@ def _float_setting(name, value, lo, hi):
     return n
 
 
+def cost_overview(cfg, plan):
+    """Estimated cost + saving vs 'always-on', using the configured kpWh price."""
+    price = float(cfg.get("PRICE_PER_KWH") or 0.0)
+    if not plan:
+        return None
+    plan_kwh = plan.get("energy_kwh")
+    if not isinstance(plan_kwh, (int, float)):
+        return None
+    c = {"price_per_kwh": price, "plan_kwh": plan_kwh, "cost_plan": plan_kwh * price}
+    alwayson = plan.get("energy_alwayson_kwh")
+    if isinstance(alwayson, (int, float)):
+        cost_always = alwayson * price
+        saving_kwh = max(0.0, alwayson - plan_kwh)
+        saving_cost = max(0.0, cost_always - plan_kwh * price)
+        c.update({
+            "alwayson_kwh": alwayson, "cost_alwayson": cost_always,
+            "saving_kwh": saving_kwh, "saving_cost": saving_cost,
+            "saving_pct": (saving_cost / cost_always * 100.0) if cost_always > 0 else 0.0,
+        })
+    return c
+
+
 def scheduler_payload(app):
     cfg = app.cfg.scheduler_cfg
     return {
@@ -141,6 +163,8 @@ def scheduler_payload(app):
         "eco": int(cfg["ECO_TEMP"]),
         "floor": int(cfg["FLOOR_TEMP"]),
         "margin": float(cfg["MARGIN"]),
+        "price_per_kwh": float(cfg.get("PRICE_PER_KWH") or 0.0),
+        "cost": cost_overview(cfg, app._plan),
         "location": cfg["LOCATION"],
         "lat": cfg["LAT"] if cfg["LAT"] is not None else app._lat,
         "lon": cfg["LON"] if cfg["LON"] is not None else app._lon,
@@ -638,6 +662,7 @@ class SpaServer:
         eco = _int_setting("eco", payload.get("eco", cur["ECO_TEMP"]), 5, 40)
         floor = _int_setting("floor", payload.get("floor", cur["FLOOR_TEMP"]), 0, 40)
         margin = _float_setting("margin", payload.get("margin", cur["MARGIN"]), 0, 10)
+        price = _float_setting("price", payload.get("price", cur.get("PRICE_PER_KWH", 0)), 0, 10)
         if not (floor <= eco <= target):
             raise ValueError("temperatures must satisfy floor ≤ eco ≤ target")
 
@@ -691,6 +716,7 @@ class SpaServer:
         env["ECO_TEMP"] = str(eco)
         env["FLOOR_TEMP"] = str(floor)
         env["MARGIN"] = ("%g" % margin)
+        env["PRICE_PER_KWH"] = ("%g" % price)
         with open(path, "w") as f:
             for key in sorted(env):
                 f.write("%s=%s\n" % (key, env[key]))

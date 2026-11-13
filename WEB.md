@@ -69,6 +69,7 @@ A config update looks like:
 {"config": {
   "window": "17:00-23:00",
   "target": 40, "eco": 28, "floor": 8, "margin": 0,
+  "price": 0.2263,
   "overrides": {"SAT": "14:00-23:00", "SUN": ""},
   "location": "London, England, United Kingdom", "lat": 51.5074, "lon": -0.1278
 }}
@@ -92,6 +93,14 @@ The `/api/scheduler` payload carries the full current state, including the
 `model` object: the `UA` cooling rate and `P` heater power currently in use,
 the number of `ua_samples`, the `source` (`default`, `calibrated`, or
 `online coast-down`) and when it was last saved.
+
+**Energy cost.** The plan carries `energy_kwh` (the optimal-start consumption
+over the horizon) and `energy_alwayson_kwh` (the baseline `kWh` to hold the
+tub at target 24/7). The `/api/scheduler` payload adds a `cost` object —
+`cost_plan`, `cost_alwayson`, `saving_cost` and `saving_pct` — priced with the
+configurable `PRICE_PER_KWH` (editable as `price` in the settings UI / config
+save, stored in `scheduler.env`). The dashboard shows the estimated spend and
+how much is saved vs leaving the heater on all the time.
 
 The plan payload carries a per-hour **schedule projection** used by the
 forecast chart: `plan_water` (projected water temperature), `plan_set`

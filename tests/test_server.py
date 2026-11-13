@@ -426,6 +426,21 @@ class TestSchedulerConfigUpdate(unittest.TestCase):
         self.assertEqual(info2["source"], "online coast-down")
         self.assertEqual(info2["saved_at"], 123456)
 
+    def test_cost_overview_computes_saving(self):
+        cfg = _scheduler_cfg()
+        cfg["PRICE_PER_KWH"] = 0.2263
+        plan = {"energy_kwh": 4.0, "energy_alwayson_kwh": 10.0}
+        c = server.cost_overview(cfg, plan)
+        self.assertAlmostEqual(c["cost_plan"], 0.2263 * 4.0)
+        self.assertAlmostEqual(c["cost_alwayson"], 0.2263 * 10.0)
+        self.assertAlmostEqual(c["saving_cost"], 0.2263 * 6.0)
+        self.assertAlmostEqual(c["saving_pct"], 60.0, places=6)
+
+    def test_update_config_accepts_price(self):
+        out = self.app.update_scheduler_config({"price": 0.312})
+        self.assertAlmostEqual(out["price_per_kwh"], 0.312)
+        self.assertAlmostEqual(float(self._env()["PRICE_PER_KWH"]), 0.312)
+
     def test_payload_includes_location_and_model(self):
         out = self.app.update_scheduler_config({"window": "17:00-23:00"})
         self.assertIn("location", out)

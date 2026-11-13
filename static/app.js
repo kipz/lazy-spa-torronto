@@ -755,7 +755,14 @@ function syncMode() {
 function refreshFacts() {
   if (state.plan) {
     $("#factAmb").textContent = (state.plan.ambient_now != null ? state.plan.ambient_now.toFixed(1) : "—") + "°";
-    $("#factEnergy").textContent = state.plan.energy_kwh != null ? state.plan.energy_kwh.toFixed(1) + " kWh" : "—";
+    if (state.plan && state.plan.energy_kwh != null) {
+      let txt = state.plan.energy_kwh.toFixed(1) + " kWh";
+      const cost = state.config && state.config.cost;
+      if (cost && cost.cost_plan != null) txt += " · £" + cost.cost_plan.toFixed(2);
+      $("#factEnergy").textContent = txt;
+    } else {
+      $("#factEnergy").textContent = "—";
+    }
   }
   const cur = state.current;
   if (cur && cur.temp != null) {
@@ -844,6 +851,7 @@ function renderConfig() {
   $("#cfgTemps").textContent = (d.target != null ? d.target : "—") + " / "
     + (d.eco != null ? d.eco : "—") + " / " + (d.floor != null ? d.floor : "—");
   $("#cfgMargin").textContent = (d.margin != null ? d.margin : "—") + "°";
+  renderCost(d.cost, d.price_per_kwh);
   const ov = d.overrides || {};
   const active = DAYS.filter((day) => ov[day]).map((day) => day + " " + ov[day]);
   $("#cfgOverrides").textContent = active.length ? active.join(", ") : "none";
@@ -867,6 +875,23 @@ function renderConfig() {
     state.phase = d.phase;
     $("#factPhase").textContent = d.phase.toUpperCase();
   }
+}
+
+function renderCost(cost, price) {
+  const kb = $("#cfgCost");
+  const sb = $("#cfgSaving");
+  const fmtP = (v) => "£" + Number(v).toFixed(2);
+  if (!cost || cost.plan_kwh == null) {
+    kb.textContent = (price != null ? "Σ" : "—");
+    sb.textContent = "—";
+    return;
+  }
+  kb.textContent = cost.plan_kwh.toFixed(1) + " kWh · " + fmtP(cost.cost_plan)
+    + (price != null ? " @" + Number(price).toFixed(3) + "/kWh" : "");
+  if (cost.saving_cost != null)
+    sb.textContent = fmtP(cost.saving_cost) + " (" + cost.saving_pct.toFixed(0) + "%)";
+  else
+    sb.textContent = "—";
 }
 
 function refreshConfig() {
@@ -895,6 +920,7 @@ function openSettings() {
   $("#setEco").value = c.eco != null ? c.eco : 28;
   $("#setFloor").value = c.floor != null ? c.floor : 8;
   $("#setMargin").value = c.margin != null ? c.margin : 0;
+  $("#setPrice").value = c.price_per_kwh != null ? c.price_per_kwh : 0.2263;
   // Location field: reflect current location; keep pinned coords in the payload.
   $("#setLocation").value = c.location || "";
   state._locPicked = c.lat != null && c.lon != null ? { lat: c.lat, lon: c.lon } : null;
@@ -922,6 +948,8 @@ function validateSettings(payload) {
   if (!raw(payload.eco) || !Number.isInteger(eco) || eco < 5 || eco > 40) return "Eco must be a whole number from 5 to 40";
   if (!raw(payload.floor) || !Number.isInteger(floor) || floor < 0 || floor > 40) return "Floor must be a whole number from 0 to 40";
   if (!raw(payload.margin) || !Number.isFinite(margin) || margin < 0 || margin > 10) return "Margin must be between 0 and 10";
+  const price = Number(raw(payload.price));
+  if (!raw(payload.price) || !Number.isFinite(price) || price < 0 || price > 3) return "Electricity price must be between 0 and 3 £/kWh";
   if (!(floor <= eco && eco <= target)) return "Temperatures must satisfy floor ≤ eco ≤ target";
   for (const day of DAYS) {
     const spec = payload.overrides[day];
@@ -940,6 +968,7 @@ async function saveSettings(e) {
     eco: $("#setEco").value,
     floor: $("#setFloor").value,
     margin: $("#setMargin").value,
+    price: $("#setPrice").value,
     overrides: {},
   };
   DAYS.forEach((day) => { payload.overrides[day] = $("#setWin" + day).value.trim(); });

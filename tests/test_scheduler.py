@@ -238,6 +238,17 @@ class TestThermalModel(unittest.TestCase):
         cfg2 = make_cfg(UA_KW_PER_C=0.03, WIND_SENSITIVITY=0.0)
         self.assertAlmostEqual(scheduler.make_ua(cfg2, wind_ms=50), 0.03)
 
+    def test_always_on_energy_holds_target_vs_ambient(self):
+        cfg = make_cfg(UA_KW_PER_C=0.03, TARGET_TEMP=40)
+        series = [(ts_at(i), 0.0) for i in range(3)]   # 3 h at 0 degC ambient
+        self.assertAlmostEqual(scheduler.always_on_energy(cfg, series),
+                               0.03 * 40 * 3, places=4)
+
+    def test_always_on_energy_ignores_ambient_above_target(self):
+        cfg = make_cfg(UA_KW_PER_C=0.05, TARGET_TEMP=40)
+        series = [(ts_at(i), 50.0) for i in range(3)]  # ambient warmer than target
+        self.assertEqual(scheduler.always_on_energy(cfg, series), 0.0)
+
     def test_coast_cools_toward_ambient(self):
         cfg = make_cfg(C_KWH_PER_C=1.45, UA_KW_PER_C=0.03)
         series = make_series(0, hours=2, t_amb=10.0)
@@ -482,6 +493,8 @@ class TestSchedulerStep(unittest.TestCase):
         self.assertEqual(len(res["plan_water"]), n)
         self.assertEqual(len(res["plan_set"]), n)
         self.assertEqual(len(res["plan_phase"]), n)
+        self.assertIn("energy_alwayson_kwh", res)
+        self.assertIsInstance(res["energy_alwayson_kwh"], float)
         self.assertTrue(all(-5 <= v <= 40.5 for v in res["plan_water"]))
         self.assertTrue(set(res["plan_set"]) <= {28, 40})
         self.assertTrue(set(res["plan_phase"]) <= {"window", "preheat", "eco"})

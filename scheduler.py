@@ -64,6 +64,7 @@ DEFAULTS = {
     "WIND_SENSITIVITY": 0.0,        # UA scaling per m/s wind (0 = ignore)
     "SOLAR_GAIN_KW": 0.0,           # peak kW absorbed from sun on cover
     "HORIZON_H": 168,               # planning horizon (hours) == 7-day forecast
+    "PRICE_PER_KWH": 0.2263,        # GBP per kWh (edited in the UI; ~22.6p rate)
     "STEP_H": 1.0,                  # control timestep (hours)
     "LOG_FILE": "scheduler.log",
 }
@@ -124,7 +125,7 @@ def load_config():
     cfg.update(load_env(os.path.join(BASE_DIR, "scheduler.env")))
     for k in ("TARGET_TEMP", "ECO_TEMP", "FLOOR_TEMP", "MARGIN",
               "C_KWH_PER_C", "P_HEAT_KW", "UA_KW_PER_C", "WIND_SENSITIVITY",
-              "SOLAR_GAIN_KW", "HORIZON_H", "STEP_H"):
+              "SOLAR_GAIN_KW", "HORIZON_H", "STEP_H", "PRICE_PER_KWH"):
         try:
             cfg[k] = float(cfg[k])
         except (TypeError, ValueError):
@@ -421,6 +422,20 @@ def simulate(cfg, series, T0, windows, u_schedule=None, verbose=False):
     return temps, us, energy
 
 
+def always_on_energy(cfg, series):
+    """kWh to hold the tub continuously at target over `series`.
+
+    The naive "leave it at target 24/7" baseline: every hour it must replace
+    the heat lost to ambient (loss = UA*(T_target - T_amb)). The scheduler's
+    planned energy is lower because it coasts to ECO between windows; the gap
+    is the estimated saving.
+    """
+    ua = make_ua(cfg)
+    target = float(cfg["TARGET_TEMP"]) + float(cfg["MARGIN"])
+    step = float(cfg["STEP_H"])
+    return sum(max(0.0, ua * (target - amb)) * step for _ts, amb in series)
+
+
 def optimal_start(cfg, series, T0, windows):
     """Backward induction: latest heating start so every future requirement holds.
 
@@ -709,6 +724,7 @@ def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True):
         "plan_set": [target if p != "eco" else eco for p in phases],
         "plan_phase": phases,
         "energy_kwh": energy,
+        "energy_alwayson_kwh": round(always_on_energy(cfg, series), 2),
         "changed": changed,
         "series_start": series[0][0],
     }

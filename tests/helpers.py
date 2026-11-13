@@ -34,7 +34,7 @@ def make_cfg(**overrides):
     cfg.update(overrides)
     for k in ("TARGET_TEMP", "ECO_TEMP", "FLOOR_TEMP", "MARGIN",
               "C_KWH_PER_C", "P_HEAT_KW", "UA_KW_PER_C", "WIND_SENSITIVITY",
-              "SOLAR_GAIN_KW", "HORIZON_H", "STEP_H"):
+              "SOLAR_GAIN_KW", "HORIZON_H", "STEP_H", "PRICE_PER_KWH"):
         try:
             cfg[k] = float(cfg[k])
         except (TypeError, ValueError):

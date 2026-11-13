@@ -158,7 +158,7 @@ body {
   border-radius: 8px; padding: 5px 10px; font-size: 12px; cursor: pointer; transition: all .15s;
 }
 .pill-btn.active { background: var(--accent); color: #06121f; border-color: var(--accent); font-weight: 700; }
-.legend { display: flex; gap: 18px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 8px; font-size: 12px; color: var(--muted); }
 .lg { display: inline-flex; align-items: center; gap: 6px; }
 .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
 .sw.water { background: var(--accent); }
@@ -281,6 +281,24 @@ input[type=range]::-moz-range-thumb {
   max-width: 62%; min-width: 0; align-self: center;
 }
 .auto-row .loc-link:hover { text-decoration: underline; border-bottom-style: solid; }
+.auto-devices { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.auto-devices .dev {
+  display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px;
+  background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.09);
+  border-radius: 999px; padding: 4px 10px; color: var(--muted);
+}
+.auto-devices .dev.on { color: var(--text); }
+.auto-devices .dev .on b { color: var(--eco); }
+.auto-devices .dev b { font-weight: 800; }
+.auto-devices .dev.on b { color: var(--accent); }
+.auto-devices .dev em {
+  font-style: normal; font-size: 9px; font-weight: 800; text-transform: uppercase;
+  letter-spacing: .05em; background: rgba(124,92,255,0.28); color: #b9a8ff;
+  padding: 1px 6px; border-radius: 999px;
+}
+.auto-devices .dev i { font-style: normal; }
+#autoDevicesHint { margin: 8px 0 0; color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+#autoDevicesHint[style*="display: none"] { display: none !important; }
 
 .plan-strip { position: relative; display: flex; margin-top: 14px; }
 .plan-strip .blk { height: 26px; border-radius: 4px; flex: 1 1 0; margin-right: 3px; transition: background .3s; }
@@ -409,6 +427,25 @@ input[type=range]::-moz-range-thumb {
 @media (max-width: 1100px) {
   .layout { grid-template-columns: 1fr; }
   .oplog { position: static; max-height: 320px; }
+
+}
+@media (max-width: 600px) {
+  body { padding: 8px; }
+  .app { gap: 12px; }
+  .topbar { padding: 10px 12px; gap: 10px; }
+  .subtitle { display: none; }
+  .topbar-right { gap: 8px; }
+  .hero { padding: 18px; gap: 14px; }
+  .fact-v { font-size: 19px; }
+  #chart { height: 240px; }
+  #fcChart { height: 220px; }
+  .chart-card { padding: 16px; }
+  .modal-card { padding: 20px; }
+  .plan-strip .blk { height: 22px; }
+  .plan-axis .axis-cell { font-size: 9px; }
+  .now-conditions { font-size: 11.5px; padding: 8px 10px; }
+  .day-card { min-width: 96px; }
+  .oplog { max-height: 280px; }
 }
 
 /* ---------- toasts + confirm ---------- */

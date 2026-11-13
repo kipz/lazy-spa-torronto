@@ -597,6 +597,7 @@ function reflectShadow() {
   if (s.water_temperature != null) setGauge(s.water_temperature);
   $("#factError").textContent = s.error_code || "none";
   renderHeat(s);
+  renderAutoDevices();
 }
 
 // Semantic heater state. Prefer the server-computed `heater`; fall back to
@@ -633,6 +634,35 @@ function renderHeat(shadow) {
   $("#factHeat").className = "fact-v status-" + status;
 }
 
+// Auto-mode device states: makes pump/filter behaviour explicit (filtering
+// runs independently of heating). Scheduler-owned items get an 'auto' tag.
+function renderAutoDevices() {
+  const host = $("#autoDevices");
+  if (!host) return;
+  const s = state.shadow || {};
+  const auto = state.mode === "auto";
+  const on = (v) => !!(v && v !== "0");
+  const heatText = state.heater || heaterLabel(s, null);
+  const filterDetail = s.filter_state === 2 ? "running" : on(s.filter_state) ? "on" : "off";
+  const chips = [
+    { icon: "⚡", label: "power", v: on(s.power_state) ? "on" : "off", owner: auto ? "auto" : "manual" },
+    { icon: "🌀", label: "filter pump", v: filterDetail, owner: auto ? "auto" : "manual" },
+    { icon: "🔥", label: "heater", v: heatText, owner: auto ? "auto" : "manual" },
+    { icon: "🫧", label: "bubbles", v: on(s.wave_state) ? "on" : "off", owner: "manual" },
+    { icon: "💦", label: "jet", v: on(s.hydrojet_state) ? "on" : "off", owner: "manual" },
+  ];
+  host.innerHTML = "";
+  for (const c of chips) {
+    const span = document.createElement("span");
+    const isOn = c.v !== "off" && c.v !== "idle";
+    span.className = "dev " + (isOn ? "on" : "off");
+    span.title = c.label + ": " + c.v + (c.owner === "auto" ? " (scheduler-controlled in AUTO)" : " (manual)");
+    span.innerHTML = "<i>" + c.icon + "</i> " + c.label + " <b>" + c.v + "</b>"
+      + (c.owner === "auto" ? "<em>auto</em>" : "");
+    host.appendChild(span);
+  }
+}
+
 function syncMode() {
   const auto = state.mode === "auto";
   $("#modeToggle").checked = auto;
@@ -654,6 +684,8 @@ function syncMode() {
   $("#autoHint").textContent = auto
     ? "Auto mode: the scheduler chooses power, heat, filter and target temperature. Switch to manual to take over."
     : "Manual mode: you are in control. Flip the switch to let the scheduler optimise heating.";
+  renderAutoDevices();
+  $("#autoDevicesHint").style.display = auto ? "block" : "none";
 }
 
 function refreshFacts() {

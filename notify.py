@@ -15,6 +15,7 @@ isn't set up yet.
 """
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -66,5 +67,12 @@ def send_text(text, chat_id=None):
         if payload.get("ok"):
             return True, ""
         return False, (payload.get("description") or "telegram sendMessage failed")
+    except urllib.error.HTTPError as e:  # Telegram returns errors as HTTP 4xx with a body
+        try:
+            detail = json.loads(e.read().decode("utf-8", "replace"))
+            desc = detail.get("description") or "HTTP " + str(e.code)
+        except Exception:  # noqa: BLE001
+            desc = "HTTP " + str(e.code)
+        return False, desc
     except Exception as e:  # noqa: BLE001 - never let Telegram break the server
         return False, str(e)

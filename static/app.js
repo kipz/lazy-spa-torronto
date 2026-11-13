@@ -887,9 +887,11 @@ function renderCost(cost, price) {
     return;
   }
   kb.textContent = cost.plan_kwh.toFixed(1) + " kWh · " + fmtP(cost.cost_plan)
+    + (cost.cost_monthly != null ? " · ≈" + fmtP(cost.cost_monthly) + "/mo" : "")
     + (price != null ? " @" + Number(price).toFixed(3) + "/kWh" : "");
   if (cost.saving_cost != null)
-    sb.textContent = fmtP(cost.saving_cost) + " (" + cost.saving_pct.toFixed(0) + "%)";
+    sb.textContent = fmtP(cost.saving_cost) + " (" + cost.saving_pct.toFixed(0) + "%)"
+      + (cost.saving_monthly != null ? " · ≈" + fmtP(cost.saving_monthly) + "/mo" : "");
   else
     sb.textContent = "—";
 }

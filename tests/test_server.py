@@ -262,6 +262,17 @@ class TestSpaServer(unittest.TestCase):
         self.assertIn("window", s)
         self.assertIn("12.5", s)
 
+    def test_tg_command_cost(self):
+        now = int(time.time()) - (int(time.time()) % 3600)
+        self.app._plan = {"phase": "eco", "energy_kwh": 4.0,
+                          "energy_alwayson_kwh": 10.0,
+                          "plan_ts": [now + i * 3600 for i in range(24 * 7)]}
+        self.app.cfg.scheduler_cfg["PRICE_PER_KWH"] = 0.2263
+        s = self.app._tg_command("/cost")
+        self.assertIn("kWh", s)
+        self.assertIn("month", s)
+        self.assertIn("0.2263", s)
+
     def test_tg_command_unknown_returns_none(self):
         self.assertIsNone(self.app._tg_command("/bogus"))
 
@@ -426,15 +437,19 @@ class TestSchedulerConfigUpdate(unittest.TestCase):
         self.assertEqual(info2["source"], "online coast-down")
         self.assertEqual(info2["saved_at"], 123456)
 
-    def test_cost_overview_computes_saving(self):
+    def test_cost_overview_computes_saving_and_monthly(self):
         cfg = _scheduler_cfg()
         cfg["PRICE_PER_KWH"] = 0.2263
-        plan = {"energy_kwh": 4.0, "energy_alwayson_kwh": 10.0}
+        plan = {"energy_kwh": 4.0, "energy_alwayson_kwh": 10.0,
+                "plan_ts": [0] * (24 * 7)}   # 7-day horizon
         c = server.cost_overview(cfg, plan)
         self.assertAlmostEqual(c["cost_plan"], 0.2263 * 4.0)
         self.assertAlmostEqual(c["cost_alwayson"], 0.2263 * 10.0)
         self.assertAlmostEqual(c["saving_cost"], 0.2263 * 6.0)
         self.assertAlmostEqual(c["saving_pct"], 60.0, places=6)
+        self.assertAlmostEqual(c["days"], 7.0)
+        self.assertAlmostEqual(c["cost_monthly"], 0.2263 * 4.0 * 30 / 7, places=6)
+        self.assertAlmostEqual(c["saving_monthly"], 0.2263 * 6.0 * 30 / 7, places=6)
 
     def test_update_config_accepts_price(self):
         out = self.app.update_scheduler_config({"price": 0.312})

@@ -131,15 +131,21 @@ def _float_setting(name, value, lo, hi):
     return n
 
 
-def cost_overview(cfg, plan):
-    """Estimated cost + saving vs 'always-on', using the configured kpWh price."""
+def cost_overview(cfg, plan, monthly_days=30):
+    """Estimated cost + saving vs 'always-on', using the configured price.
+
+    `monthly_days` projects the plan-horizon figures to a rolling month.
+    """
     price = float(cfg.get("PRICE_PER_KWH") or 0.0)
     if not plan:
         return None
     plan_kwh = plan.get("energy_kwh")
     if not isinstance(plan_kwh, (int, float)):
         return None
-    c = {"price_per_kwh": price, "plan_kwh": plan_kwh, "cost_plan": plan_kwh * price}
+    days = len(plan.get("plan_ts") or []) / 24.0
+    factor = monthly_days / max(1.0, days)
+    c = {"price_per_kwh": price, "plan_kwh": plan_kwh, "cost_plan": plan_kwh * price,
+         "days": round(days, 1), "cost_monthly": plan_kwh * price * factor}
     alwayson = plan.get("energy_alwayson_kwh")
     if isinstance(alwayson, (int, float)):
         cost_always = alwayson * price
@@ -149,6 +155,8 @@ def cost_overview(cfg, plan):
             "alwayson_kwh": alwayson, "cost_alwayson": cost_always,
             "saving_kwh": saving_kwh, "saving_cost": saving_cost,
             "saving_pct": (saving_cost / cost_always * 100.0) if cost_always > 0 else 0.0,
+            "alwayson_monthly": cost_always * factor,
+            "saving_monthly": saving_cost * factor,
         })
     return c
 
@@ -406,10 +414,14 @@ class SpaServer:
                     % (self.cfg.mode.upper(), phase or "?", setting or "?"))
         if c == "/plan":
             return self._tg_plan()
+        if c in ("/cost", "/price"):
+            return self._tg_cost()
         if c in ("/help", "/start"):
-            return ("Commands: <code>/status</code> full state · "
+            return ("Commands: <code>/status</code> state · "
                     "<code>/mode</code> mode/phase/target · "
-                    "<code>/plan</code> schedule · <code>/help</code> this")
+                    "<code>/plan</code> schedule · "
+                    "<code>/cost</code> energy spend/saving · "
+                    "<code>/help</code> this")
         return None
 
     def _tg_status(self):
@@ -457,6 +469,27 @@ class SpaServer:
                 "energy (plan): %s kWh"
                 % (phase or "?", setting or "?",
                    nxt_s, on24, ("%.1f" % en) if isinstance(en, (int, float)) else "?"))
+
+    def _tg_cost(self):
+        cfg = self.cfg.scheduler_cfg
+        c = cost_overview(cfg, self._plan)
+        price = float(cfg.get("PRICE_PER_KWH") or 0.0)
+        if not c:
+            return ("<b>Torronto</b> cost\n"
+                    "price: \u00A3%.4f/kWh\nplan not ready yet" % price)
+        lines = ["<b>Torronto</b> cost @ \u00A3%.4f/kWh" % price]
+        lines.append("plan (%.1fd): %.1f kWh \u00B7 \u00A3%.2f"
+                     % (c["days"], c["plan_kwh"], c["cost_plan"]))
+        if "cost_alwayson" in c:
+            lines.append("always-on would be: %.1f kWh \u00B7 \u00A3%.2f"
+                         % (c["alwayson_kwh"], c["cost_alwayson"]))
+            lines.append("saving: \u00A3%.2f (%.0f%%)"
+                         % (c["saving_cost"], c["saving_pct"]))
+            lines.append("projected month: plan \u00A3%.2f \u00B7 save \u00A3%.2f"
+                         % (c["cost_monthly"], c["saving_monthly"]))
+        else:
+            lines.append("projected month: \u00A3%.2f" % c["cost_monthly"])
+        return "\n".join(lines)
 
     def _telegram_poller(self):
         if not notify.configured():

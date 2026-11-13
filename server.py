@@ -57,6 +57,43 @@ import scheduler  # noqa: E402
 import spa  # noqa: E402
 
 
+def heater_status(state):
+    """Semantic heater state for the UI.
+
+    heater_state read semantics (see PROTOCOL.md): 0 off, 1 starting,
+    2-3 heating, 4-6 holding temperature, 7-8 winter/frost mode. A nonzero
+    value alone doesn't mean heat is being applied (e.g. eco coast-down shows
+    heater_state 4 while the tub cools), so cross-check against power and
+    water-vs-setpoint. Returns one of off|idle|heating|holding|cooling|frost].
+    """
+    if not state:
+        return "off"
+    try:
+        heat = int(state.get("heater_state") or 0)
+    except (TypeError, ValueError):
+        heat = 0
+    if state.get("power_state") not in (1, "1"):
+        return "off"
+    if heat in (7, 8):
+        return "frost-watch"
+    water = state.get("water_temperature")
+    sp = state.get("temperature_setting")
+    has = isinstance(water, (int, float)) and isinstance(sp, (int, float))
+    if heat in (1, 2, 3):
+        return "heating"
+    if heat == 0:
+        if has and water > float(sp) + 0.5:
+            return "cooling"
+        return "idle"
+    # heater_state 4..6: thermostat holding — decide via water vs setpoint.
+    if has:
+        if water < float(sp) - 0.5:
+            return "heating"     # reheat pull toward setpoint
+        if water > float(sp) + 0.5:
+            return "cooling"     # satisfied, coasting down to setpoint
+    return "holding"
+
+
 def validate_window(spec):
     """Validate/normalise an HH:MM-HH:MM use window."""
     spec = str(spec or "").strip()
@@ -612,6 +649,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "ts": int(ts),
                 "mode": app.cfg.mode,
                 "state": state,
+                "heater": heater_status(state),
                 "plan_ts": int(app._plan_ts) if app._plan else None,
             }
             if app._plan:

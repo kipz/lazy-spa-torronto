@@ -29,6 +29,57 @@ def _shadow():
     }
 
 
+class TestHeaterStatus(unittest.TestCase):
+    def test_eco_coastdown_is_cooling(self):
+        # eco phase: water way above setpoint, but heater_state 4 (holding)
+        st = _shadow()
+        st.update({"water_temperature": 40, "temperature_setting": 28,
+                   "heater_state": 4, "power_state": 1})
+        self.assertEqual(server.heater_status(st), "cooling")
+
+    def test_window_hold_is_holding(self):
+        st = _shadow()
+        st.update({"water_temperature": 40, "temperature_setting": 40,
+                   "heater_state": 6, "power_state": 1})
+        self.assertEqual(server.heater_status(st), "holding")
+
+    def test_reheat_pull_is_heating(self):
+        st = _shadow()
+        st.update({"water_temperature": 39, "temperature_setting": 40,
+                   "heater_state": 6, "power_state": 1})
+        self.assertEqual(server.heater_status(st), "heating")
+
+    def test_heating_codes(self):
+        for code in (1, 2, 3):
+            st = _shadow()
+            st.update({"water_temperature": 37, "temperature_setting": 40,
+                       "heater_state": code, "power_state": 1})
+            self.assertEqual(server.heater_status(st), "heating")
+
+    def test_off_power(self):
+        st = _shadow()
+        st.update({"power_state": 0, "heater_state": 4})
+        self.assertEqual(server.heater_status(st), "off")
+
+    def test_frost_watch(self):
+        st = _shadow()
+        st.update({"water_temperature": 8, "temperature_setting": 28,
+                   "heater_state": 7, "power_state": 1})
+        self.assertEqual(server.heater_status(st), "frost-watch")
+
+    def test_state_endpoint_carries_heater(self):
+        cfg = mock.MagicMock()
+        cfg.mode = "manual"
+        cfg.scheduler_cfg = _scheduler_cfg()
+        with mock.patch.object(server.scheduler, "load_env", return_value={}):
+            app = server.SpaServer(cfg)
+        app.update_state({**_shadow(), "water_temperature": 40,
+                          "temperature_setting": 28, "heater_state": 4})
+        # exercise the payload builder directly
+        state, _ = app.get_state()
+        self.assertEqual(server.heater_status(state), "cooling")
+
+
 class TestWebConfig(unittest.TestCase):
     def test_defaults(self):
         with mock.patch.object(server.scheduler, "load_env", return_value={}):

@@ -499,8 +499,41 @@ function reflectShadow() {
   }
   if (s.water_temperature != null) setGauge(s.water_temperature);
   $("#factError").textContent = s.error_code || "none";
-  $("#heaterBadge").className = "badge " + (s.heater_state ? "heater-on" : "heater-off");
-  $("#heaterBadge").textContent = s.heater_state ? "🔥 heater" : "🔥 heater";
+  renderHeat(s);
+}
+
+// Semantic heater state. Prefer the server-computed `heater`; fall back to
+// the protocol codes if the payload predates it.
+function heaterLabel(shadow, status) {
+  if (status) return status;
+  let heat = Number(shadow.heater_state) || 0;
+  const power = shadow.power_state === 1 || shadow.power_state === "1";
+  const water = shadow.water_temperature, sp = shadow.temperature_setting;
+  if (!power || heat === 0) return "off";
+  if (heat >= 7) return "frost-watch";
+  if (heat <= 3) return "heating";
+  if (typeof water === "number" && typeof sp === "number") {
+    if (water < sp - 0.5) return "heating";
+    if (water > sp + 0.5) return "cooling";
+  }
+  return "holding";
+}
+
+function renderHeat(shadow) {
+  const status = heaterLabel(shadow, state.heater);
+  const badge = $("#heaterBadge");
+  const label = {
+    heating: ["🔥 heating", "heater-on"],
+    cooling: ["❄ cooling", "heater-cool"],
+    holding: ["🔥 holding", "heater-hold"],
+    "frost-watch": ["🧊 frost watch", "heater-frost"],
+    idle: ["heat on", "heater-hold"],
+    off: ["heat off", "heater-off"],
+  }[status] || ["heat", "heater-off"];
+  badge.className = "badge " + label[1];
+  badge.textContent = label[0];
+  $("#factHeat").textContent = status.replace("-", " ");
+  $("#factHeat").className = "fact-v status-" + status;
 }
 
 function syncMode() {
@@ -540,21 +573,51 @@ function refreshFacts() {
 
 function renderPlanStrip() {
   const strip = $("#planStrip");
+  const axis = $("#planAxis");
   strip.innerHTML = "";
+  axis.innerHTML = "";
   if (!state.plan || !state.plan.plan_ts) return;
   const n = Math.min(state.plan.plan_ts.length, 24);
   const now = Date.now() / 1000;
+  const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const first = state.plan.plan_ts[0];
   for (let i = 0; i < n; i++) {
+    const ts = state.plan.plan_ts[i];
+    const d = new Date(ts * 1000);
+    const hh = d.getHours();
+    // heater block
     const b = document.createElement("div");
     b.className = "blk " + (state.plan.plan_us[i] ? "on" : "off");
-    const ts = state.plan.plan_ts[i];
     if (ts <= now && now < ts + 3600) b.classList.add("now");
-    const d = new Date(ts * 1000);
-    b.title = (d.getHours() + ":" + String(d.getMinutes()).padStart(2, "0"))
-      + (state.plan.plan_us[i] ? " heater ON" : " off")
-      + " · " + state.plan.plan_amb[i].toFixed(0) + "°C";
+    b.title = (String(hh).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"))
+      + (state.plan.plan_us[i] ? " heater ON" : " heater off")
+      + (state.plan.plan_amb && state.plan.plan_amb[i] != null
+         ? " · " + state.plan.plan_amb[i].toFixed(0) + "°C" : "");
     strip.appendChild(b);
+    // time axis label (every 3 h, plus day rollover at 00:00)
+    const a = document.createElement("div");
+    a.className = "axis-cell";
+    if (i === 0 || hh % 3 === 0) {
+      const t = String(hh).padStart(2, "0") + ":00";
+      a.textContent = (hh === 0 && i !== 0) ? (DAYS[d.getDay()] + " " + t) : t;
+    }
+    axis.appendChild(a);
   }
+  // clear "now" marker spanning the strip at the current time
+  const marker = document.createElement("i");
+  marker.className = "now-marker";
+  if (first && now >= first && now < first + n * 3600) {
+    const frac = (now - first) / (n * 3600);
+    const pitch = (strip.clientWidth + 3) / n;      // block + 3px gap per hour
+    const idx = Math.min(n - 1, Math.floor(frac * n));
+    const within = (frac * n) - idx;                // position inside the hour
+    const x = idx * pitch + within * (pitch - 3);
+    marker.innerHTML = "<b>now</b>";
+    marker.style.left = Math.round(x) + "px";
+  } else {
+    marker.style.display = "none";
+  }
+  strip.appendChild(marker);
 }
 
 function renderConfig() {
@@ -820,6 +883,7 @@ async function loadState() {
     const d = await api("/api/state");
     state.mode = d.mode;
     state.shadow = d.state || {};
+    state.heater = d.heater;
     if (d.ts) state.shadow._ts = d.ts;
     if (d.phase) state.phase = d.phase;
     syncMode();

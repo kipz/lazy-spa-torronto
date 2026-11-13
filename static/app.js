@@ -567,8 +567,15 @@ function renderConfig() {
   const active = DAYS.filter((day) => ov[day]).map((day) => day + " " + ov[day]);
   $("#cfgOverrides").textContent = active.length ? active.join(", ") : "none";
   const loc = (d.location || "").trim();
-  $("#cfgLocation").textContent = loc
-    + (d.lat != null && d.lon != null ? ` (${d.lat}, ${d.lon})` : "");
+  const lnk = $("#cfgLocation");
+  lnk.textContent = loc || "—";
+  if (d.lat != null && d.lon != null && loc) {
+    lnk.href = "https://maps.google.com/?q=" + Number(d.lat) + "," + Number(d.lon);
+    lnk.title = "Open " + loc + " in Google Maps";
+  } else {
+    lnk.href = "#";
+    lnk.title = loc || "no location set";
+  }
   const m = d.model || {};
   $("#cfgModel").textContent = `UA ${m.ua} · P ${m.p} kW`
     + (m.samples ? ` · ${m.samples} samples` : "");

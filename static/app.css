@@ -235,8 +235,15 @@ input[type=range]::-moz-range-thumb {
 .auto-row { display: flex; justify-content: space-between; padding: 5px 0; font-size: 13px; border-bottom: 1px dashed rgba(255,255,255,0.07); }
 .auto-row span { color: var(--muted); }
 .auto-row code { font-family: var(--mono); }
-.auto-row .m-row { display: flex; align-items: center; gap: 8px; }
+.auto-row .m-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .auto-row .m-row code { color: var(--text); }
+.auto-row .loc-link {
+  font-family: var(--mono); color: var(--accent); text-decoration: none;
+  border-bottom: 1px dotted rgba(124, 92, 255, 0.5);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 62%; min-width: 0; align-self: center;
+}
+.auto-row .loc-link:hover { text-decoration: underline; border-bottom-style: solid; }
 
 .plan-strip { display: flex; gap: 3px; margin-top: 14px; }
 .plan-strip .blk { height: 26px; border-radius: 4px; flex: 1; transition: background .3s; }

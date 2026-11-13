@@ -365,13 +365,44 @@ function renderDayCards() {
     let precip = "";
     if (dd.precipProb != null)
       precip = '<span class="day-precip" title="precipitation chance">💧' + dd.precipProb.toFixed(0) + "%</span>";
+    // per-day heating schedule from the plan projection, so the way the
+    // forecast changes the plan is visible (earlier preheat on colder days)
+    const sched = dayPlanStats(dd.ts);
+    const schedHtml = sched
+      ? '<span class="day-sched" title="projected from today\'s weather + measured UA">'
+        + "🕘 preheat " + sched.firstHeat + ":00 · 🔌 " + sched.onH + "h ON · min "
+        + sched.minW.toFixed(1) + "°</span>"
+      : "";
     card.innerHTML =
       '<span class="day-name">' + (dd.emoji ? dd.emoji + " " : "") + dd.name + "</span>" +
       '<span class="day-date">' + dd.date + (dd.label ? " · " + dd.label : "") + "</span>" +
       '<span class="day-bar"><i style="left:' + left + "%;width:" + width + '%"></i></span>' +
-      '<span class="day-temp"><b>' + dd.hi.toFixed(0) + '°</b><span class="day-lo">' + dd.lo.toFixed(0) + "°</span>" + precip + "</span>";
+      '<span class="day-temp"><b>' + dd.hi.toFixed(0) + '°</b><span class="day-lo">' + dd.lo.toFixed(0) + "°</span>" + precip + "</span>" +
+      schedHtml;
     host.appendChild(card);
   }
+}
+
+function dayPlanStats(dayTs) {
+  const plan = state.plan;
+  if (!plan || !plan.plan_ts || !plan.plan_us) return null;
+  const d0 = new Date(Number(dayTs) * 1000);
+  d0.setHours(0, 0, 0, 0);
+  const start = d0.getTime() / 1000;
+  const end = start + 86400;
+  let firstHeat = null, onH = 0, minW = Infinity;
+  for (let i = 0; i < plan.plan_ts.length; i++) {
+    const t = plan.plan_ts[i];
+    if (t < start || t >= end) continue;
+    if (plan.plan_us[i]) {
+      onH++;
+      if (firstHeat == null) firstHeat = new Date(t * 1000).getHours();
+    }
+    if (plan.plan_water && plan.plan_water[i] != null)
+      minW = Math.min(minW, plan.plan_water[i]);
+  }
+  if (firstHeat == null) return null;
+  return { firstHeat, onH, minW };
 }
 
 function drawForecastChart() {
@@ -508,6 +539,30 @@ function drawForecastChart() {
     ctx.beginPath();
     plan_water.forEach((v, i) => (i ? ctx.lineTo(X(plan_ts[i]), Y(v)) : ctx.moveTo(X(plan_ts[i]), Y(v))));
     ctx.stroke();
+  }
+
+  // preheat-start markers: show how the forecast shifts the preheat timing
+  const starts = [];
+  let prevPhase = "";
+  for (let i = 0; i < plan_phase.length; i++) {
+    if (plan_phase[i] === "preheat" && prevPhase !== "preheat") starts.push(i);
+    prevPhase = plan_phase[i];
+  }
+  if (starts.length) {
+    ctx.fillStyle = "#ffd166";
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "center";
+    for (const i of starts) {
+      const x = X(plan_ts[i]);
+      ctx.beginPath();
+      ctx.moveTo(x, pad.t + ih - 8);
+      ctx.lineTo(x - 4, pad.t + ih);
+      ctx.lineTo(x + 4, pad.t + ih);
+      ctx.closePath();
+      ctx.fill();
+      const d = new Date(plan_ts[i] * 1000);
+      ctx.fillText("▲ " + String(d.getHours()).padStart(2, "0") + ":00", x, H - 2);
+    }
   }
 }
 

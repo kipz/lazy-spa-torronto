@@ -190,6 +190,7 @@ body {
   padding: 2px 9px; font-weight: 800; font-size: 11px;
 }
 .day-precip { display: block; font-size: 11px; color: #7fb0ff; margin-top: 2px; }
+.day-sched { display: block; font-size: 10.5px; color: var(--muted); margin-top: 3px; line-height: 1.4; }
 .day-cards { display: flex; gap: 10px; margin: 12px 0 14px; flex-wrap: wrap; }
 .day-card {
   flex: 1 1 110px; min-width: 104px; padding: 10px 12px; border-radius: 12px;

@@ -56,7 +56,7 @@ Switching to Auto while mid-preheat asks for confirmation.
 | GET | `/api/plan` | 48 h optimal-start heater plan + energy + projected water/setpoint/phase per hour |
 | GET | `/api/scheduler` | Mode, windows, per-day overrides, target/eco/floor/margin, location + lat/lon, measured model (`ua`, `p`, samples, source) |
 | POST | `/api/scheduler` | `{"mode":"auto"\|"manual"}`, `{"replan":true}`, or `{"config":{...}}` |
-| GET | `/api/weather?days=3` | Hourly forecast for 1–7 days (`days` defaults to 3) |
+| GET | `/api/weather?days=3` | Rich forecast for 1–7 days: `current` conditions, `hourly` (temp, feels-like, dew, humidity, precip chance/amount, wind/gusts/direction, cloud, pressure, WMO condition) and `daily` summaries (`days` defaults to 3) |
 | GET | `/api/location/search?q=...` | Geocoding type-ahead suggestions for the location editor |
 | POST | `/api/cmd` | `{"datapoint","value"}` — clamped 20–40, temp rejected in auto |
 | GET | `/api/health` | Connectivity, last update age |
@@ -97,7 +97,9 @@ The plan payload carries a per-hour **schedule projection** used by the
 forecast chart: `plan_water` (projected water temperature), `plan_set`
 (setpoint the scheduler would apply) and `plan_phase` (`window` / `preheat` /
 `eco`) aligned with `plan_ts`. Together with `plan_amb` and `plan_us` this
-renders how the coming days' weather drives heating.
+renders how the coming days' weather drives heating. The default planning
+horizon is 7 days (`HORIZON_H=168`), so the projection covers the whole
+forecast view.
 
 ## Operation log persistence
 

@@ -45,6 +45,7 @@ UA_SAMPLE_MAX_N = 50               # rolling median window
 UA_BOUNDS = (0.005, 0.3)           # kW/degC, sane physical range
 UA_AMBIENT_MIN_DIFF = 3.0          # need a clear water/ambient difference
 UA_SETPOINT_MARGIN = 1.0           # only fit well above setpoint (thermostat idle)
+NOTIFY_COOLDOWN_S = 3600           # Telegram "target reached" at most once/hr
 DAY_NAMES = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 WINDOW_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$")
 DP_LOG_LABELS = {
@@ -55,6 +56,7 @@ DP_LOG_LABELS = {
 
 import scheduler  # noqa: E402
 import spa  # noqa: E402
+import notify  # noqa: E402
 
 
 def heater_status(state):
@@ -189,6 +191,8 @@ class SpaServer:
         self._ua_samples = []       # recent coast-down UA estimates (kW/degC)
         self._amb = {}              # ts -> forecast ambient, kept across plans
         self._plan = None           # latest scheduler_step() result
+        self._notify_at = 0.0       # last Telegram "target reached" send
+        self._prev_water = None     # previous water temp (rising-edge detect)
         self._plan_ts = 0.0
         self._tokens = None
         self._stopping = False
@@ -228,6 +232,7 @@ class SpaServer:
                              if h["ts"] > now - HISTORY_SECONDS]
         self._maybe_log_shadow(state)
         self._maybe_sample_ua(state)
+        self._maybe_notify(state)
         self._broadcast("state")
 
     def get_state(self):
@@ -326,6 +331,42 @@ class SpaServer:
         self.add_log("info",
                      "Cooling rate measured: UA=%.4f kW/°C from %d coast-downs"
                      % (new_ua, len(self._ua_samples)))
+
+    def _maybe_notify(self, state):
+        """Telegram 'tub reached target' alert, at most once per hour.
+
+        Notifies on the rising edge (water crosses above the scheduler's
+        TARGET while in window/preheat). Nothing happens until telegram.env is
+        configured; failures are logged, never fatal.
+        """
+        if not notify.configured():
+            self._prev_water = state.get("water_temperature")
+            return
+        now = time.time()
+        water = state.get("water_temperature")
+        target = self.cfg.scheduler_cfg.get("TARGET_TEMP")
+        phase = (self._plan or {}).get("phase") if self._plan else None
+        if not isinstance(water, (int, float)) or not isinstance(target, (int, float)):
+            self._prev_water = water
+            return
+        reached = water >= float(target)
+        prev = self._prev_water
+        self._prev_water = water
+        rising_edge = (reached and (prev is None or prev < float(target)))
+        if not rising_edge:
+            return
+        if phase not in ("window", "preheat"):
+            return
+        if now - self._notify_at < NOTIFY_COOLDOWN_S:
+            return
+        self._notify_at = now
+        msg = ("<b>Torronto</b> · the tub has reached <b>%g°C</b> (target %g°C, %s)."
+               % (water, target, phase))
+        ok, err = notify.send_text(msg)
+        self.add_log("ok" if ok else "warn",
+                     "Telegram target-reached %s (%s)"
+                     % ("sent" if ok else "failed: " + err, phase))
+        self._broadcast("log")
 
     def _save_model_ua(self, ua):
         path = os.path.join(BASE_DIR, "scheduler_model.json")

@@ -201,6 +201,39 @@ class TestSpaServer(unittest.TestCase):
                 "power_state": 1, "heater_state": 0})    # cooled ~1.4C in 2h
         self.assertEqual(len(self.app._ua_samples), 1)
 
+    def test_notify_target_reached_shoots_once_per_hour(self):
+        clock = {"now": 100.0}
+        self.app._notify_at = clock["now"] - 4000   # past the hourly cooldown
+        with mock.patch.object(server.notify, "configured", return_value=True), \
+             mock.patch.object(server.notify, "send_text",
+                               return_value=(True, "")) as send, \
+             mock.patch.object(server.time, "time", lambda: clock["now"]):
+            self.app._plan = {"phase": "window"}
+            self.app._maybe_notify({"water_temperature": 39, "power_state": 1})
+            self.app._maybe_notify({"water_temperature": 40, "power_state": 1})  # edge -> send
+            self.app._maybe_notify({"water_temperature": 38, "power_state": 1})  # drop
+            clock["now"] = 110.0
+            self.app._maybe_notify({"water_temperature": 40, "power_state": 1})  # edge, cooled down < 1h
+        self.assertEqual(send.call_count, 1)
+        msgs = [e["msg"] for e in self.app.get_log(50)]
+        self.assertTrue(any("Telegram target-reached sent" in m for m in msgs), msgs)
+
+    def test_notify_skipped_in_eco(self):
+        clock = {"now": 100.0}
+        self.app._notify_at = clock["now"] - 4000
+        with mock.patch.object(server.notify, "configured", return_value=True), \
+             mock.patch.object(server.notify, "send_text") as send, \
+             mock.patch.object(server.time, "time", lambda: clock["now"]):
+            self.app._plan = {"phase": "eco"}
+            self.app._maybe_notify({"water_temperature": 40, "power_state": 1})
+        send.assert_not_called()
+
+    def test_notify_skipped_when_unconfigured(self):
+        with mock.patch.object(server.notify, "configured", return_value=False), \
+             mock.patch.object(server.notify, "send_text") as send:
+            self.app._maybe_notify({"water_temperature": 40})
+        send.assert_not_called()
+
     def test_history_window_filtering(self):
         now = int(time.time())
         with self.app._lock:

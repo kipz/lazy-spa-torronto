@@ -169,6 +169,26 @@ class TestSpaServer(unittest.TestCase):
         self.assertEqual(model["ua_samples"], 3)
         self.assertAlmostEqual(model["UA_KW_PER_C"], 0.0308, delta=0.002)
 
+    def test_register_history_derives_heater_kw(self):
+        base = int(time.time()) - (int(time.time()) % 3600)
+        rows = [
+            {"ts": base - 2 * 3600, "shadow": {"water_temperature": 38, "heater_state": 6, "B3": 43}},
+            {"ts": base - 3600,     "shadow": {"water_temperature": 39, "heater_state": 6, "B3": 43}},
+            {"ts": base,            "shadow": {"water_temperature": 40, "heater_state": 4, "B3": 43}},
+        ]
+        with open(os.path.join(self.tmp.name, "shadow_log.jsonl"), "w") as f:
+            for r in rows:
+                f.write(json.dumps(r, separators=(",", ":")) + "\n")
+        with mock.patch.object(server.scheduler, "fetch_forecast", return_value={}):
+            series = self.app._register_history(24)
+        self.assertEqual(len(series), 3)
+        self.assertTrue(series[1]["on"])      # heater_state 6 -> elements on
+        self.assertFalse(series[2]["on"])     # heater_state 4 -> holding, off
+        self.assertEqual(series[1]["b3"], 43)
+        self.assertIsNotNone(series[1]["kw"])
+        self.assertIsNone(series[2]["kw"])    # heater off -> no inferred kW
+        self.assertAlmostEqual(series[1]["kw"], 1.45 * 1.0 / 1.0, places=2)  # C*dT/dt
+
     def test_does_not_fit_while_heating(self):
         base = 1_800_000_000
         self.app._amb = {base + h * 3600: 5.0 for h in range(8)}

@@ -26,6 +26,7 @@ const state = {
   log: [],
   range: 24,
   fcDays: 3,
+  registerHistory: [],
   tempLocked: false,
 };
 
@@ -796,6 +797,78 @@ function renderNowConditions() {
   host.innerHTML = "Now: <span class='now-cats'>" + items.join(" · ") + "</span>" + pill;
 }
 
+function drawHeaterChart() {
+  const cv = $("#heaterChart");
+  if (!cv) return;
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (!W || !H) return;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const ctx = cv.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+  const pad = { l: 46, r: 46, t: 14, b: 26 };
+  const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+  const s = state.registerHistory || [];
+  if (!s.length) {
+    ctx.fillStyle = "#8b97b5"; ctx.font = "13px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("collecting heater data…", W / 2, H / 2); return;
+  }
+  const t0 = s[0].ts, t1 = s[s.length - 1].ts, span = Math.max(1, t1 - t0);
+  const waters = s.map((p) => p.water).filter((v) => v != null);
+  let wLo = Math.floor(Math.min.apply(null, waters) - 1);
+  let wHi = Math.ceil(Math.max.apply(null, waters) + 1);
+  const kws = s.map((p) => p.kw).filter((v) => typeof v === "number");
+  let kWmax = 0;
+  if (kws.length) { const mx = Math.max.apply(null, kws.map(Math.abs)); kWmax = Math.max(1.5, mx); }
+  const X = (ts) => pad.l + iw * (ts - t0) / span;
+  const Yw = (t) => pad.t + ih * (1 - (t - wLo) / (wHi - wLo));
+  const Yk = (k) => pad.l ? pad.t + ih * (1 - (k + kWmax) / (2 * kWmax)) : 0;
+  const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  // grid
+  ctx.strokeStyle = "rgba(255,255,255,0.06)"; ctx.fillStyle = "#8b97b5"; ctx.font = "11px sans-serif";
+  ctx.textAlign = "right";
+  for (let t = wLo; t <= wHi; t++) { ctx.beginPath(); ctx.moveTo(pad.l, Yw(t)); ctx.lineTo(W - pad.r, Yw(t)); ctx.stroke(); ctx.fillText(t + "°", pad.l - 6, Yw(t) + 4); }
+  ctx.textAlign = "left";
+  for (let t = -kWmax; t <= kWmax; t += kWmax / 2) { ctx.fillText(t.toFixed(1) + "", W - pad.r + 4, Yk(t) + 4); }
+  ctx.textAlign = "left"; ctx.fillText("kW", W - pad.r + 4, pad.t + 2);
+  ctx.textAlign = "center";
+  for (let ts = t0 - (t0 % 86400) - 86400; ts <= t1 + 86400; ts += 86400) {
+    if (ts <= t0 || ts > t1) continue;
+    ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.beginPath(); ctx.moveTo(X(ts), pad.t); ctx.lineTo(X(ts), pad.t + ih); ctx.stroke();
+    const d = new Date(ts * 1000); ctx.fillStyle = "#aab6d4"; ctx.fillText(DAY_NAMES[d.getDay()] + " " + d.getDate(), X(ts), H - 8);
+  }
+  // heater ON bands
+  ctx.fillStyle = "rgba(255,107,107,0.20)";
+  for (let i = 0; i < s.length; i++) {
+    if (!s[i].on) continue; const x0 = X(s[i].ts), x1 = (i + 1 < s.length ? X(s[i + 1].ts) : W - pad.r);
+    ctx.fillRect(x0, pad.t, Math.max(1, x1 - x0), ih);
+  }
+  // derived kW -> power-filled area + zero line
+  ctx.strokeStyle = "rgba(157,180,255,0.5)"; ctx.beginPath(); ctx.moveTo(pad.l, Yk(0)); ctx.lineTo(W - pad.r, Yk(0)); ctx.stroke();
+  ctx.fillStyle = "rgba(255,209,102,0.28)"; ctx.beginPath();
+  s.forEach((p, i) => { const v = typeof p.kw === "number" ? p.kw : 0; const y = Yk(v); i ? ctx.lineTo(X(p.ts), y) : ctx.moveTo(X(p.ts), y); });
+  ctx.lineTo(X(s[s.length - 1].ts), Yk(0)); ctx.lineTo(X(s[0].ts), Yk(0)); ctx.closePath(); ctx.fill();
+  // water temp line
+  ctx.strokeStyle = "#4fd1ff"; ctx.lineWidth = 1.8; ctx.beginPath();
+  s.forEach((p, i) => { if (p.water == null) return; const y = Yw(p.water); i ? ctx.lineTo(X(p.ts), y) : ctx.moveTo(X(p.ts), y); });
+  ctx.stroke();
+}
+
+async function loadRegisterHistory() {
+  try {
+    const d = await api("/api/history/registers?hours=168");
+    state.registerHistory = d.series || [];
+    drawHeaterChart();
+    const cur = state.registerHistory[state.registerHistory.length - 1];
+    const f = $("#heaterFacts");
+    if (cur) {
+      const on = cur.on ? "🔥 heating" : "heat off";
+      f.textContent = "pump current " + (cur.b3 != null ? cur.b3 : "?") + " · " + on;
+    } else f.textContent = "";
+  } catch (e) { /* ignore */ }
+}
+
 function renderPlanStrip() {
   const strip = $("#planStrip");
   const axis = $("#planAxis");
@@ -1174,7 +1247,7 @@ async function loadWeather() {
 
 async function refreshAll() {
   await loadState();
-  await Promise.all([loadHistory(), loadPlan(), loadWeather(), refreshConfig(), loadLog()]);
+  await Promise.all([loadHistory(), loadRegisterHistory(), loadPlan(), loadWeather(), refreshConfig(), loadLog()]);
   const el = $("#conn");
   if (state.shadow && Object.keys(state.shadow).length) {
     const age = (Date.now() / 1000) - (state.shadow._ts || 0);
@@ -1304,7 +1377,7 @@ function bindEvents() {
     loadHistory();
   });
 
-  window.addEventListener("resize", () => { drawChart(); renderForecast(); });
+  window.addEventListener("resize", () => { drawChart(); drawHeaterChart(); renderForecast(); });
 }
 
 /* ---------------- SSE ---------------- */

@@ -98,6 +98,23 @@
         </div>
       </section>
 
+      <!-- ======= Heater & pump registers ======= -->
+      <section class="chart-card glass" id="heaterCard">
+        <div class="chart-head">
+          <h2>🔌 Heater &amp; pump</h2>
+          <span class="hint" id="heaterFacts"></span>
+        </div>
+        <canvas id="heaterChart"></canvas>
+        <div class="legend">
+          <span class="lg"><i class="sw on"></i>heater ON</span>
+          <span class="lg"><i class="sw fc-water"></i>water temp</span>
+          <span class="lg"><i class="sw fc-preheat"></i>≈ heater kW (derived)</span>
+        </div>
+        <p class="hint">Drawn from the raw pump registers. “≈ heater kW” is
+          inferred from the water-temperature rise using the learned thermal
+          model — an estimate, not a metered value.</p>
+      </section>
+
       <!-- ======= Forecast & heating plan ======= -->
       <section class="chart-card glass" id="forecastCard">
         <div class="chart-head">

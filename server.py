@@ -225,6 +225,9 @@ class SpaServer:
         self._plan = None           # latest scheduler_step() result
         self._notify_at = 0.0       # last Telegram "target reached" send
         self._prev_water = None     # previous water temp (rising-edge detect)
+        self._reg_weather = None    # cached historical temps for register chart
+        self._reg_weather_ts = 0.0
+        self._reg_weather_pd = None
         self._plan_ts = 0.0
         self._tokens = None
         self._stopping = False
@@ -276,6 +279,80 @@ class SpaServer:
         cutoff = int(time.time()) - int(hours * 3600)
         with self._lock:
             return [dict(h) for h in self._history if h["ts"] >= cutoff]
+
+    def _register_history(self, hours):
+        """Raw register history from shadow_log.jsonl + derived heater kW.
+
+        Reads the persisted shadow log (full raw shadow every ~5 min), then
+        for each interval computes an inferred heater draw: when the heater's
+        elements are on (heater_state 2,3,5,6,7,8), kW = C·dT/dt + UA·(T−amb)
+        using the learned thermal model and backfilled Open-Meteo ambient.
+        Returns [{ts, water, heater, b3, on, kw}].
+        """
+        path = os.path.join(BASE_DIR, "shadow_log.jsonl")
+        rows = []
+        if os.path.exists(path):
+            with open(path) as f:
+                for line in f:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        pass
+        rows.sort(key=lambda r: r["ts"])
+        cutoff = int(time.time()) - int(hours * 3600)
+        rows = [r for r in rows if r["ts"] >= cutoff]
+        if len(rows) < 2:
+            return []
+        cfg = self.cfg.scheduler_cfg
+        C = float(cfg["C_KWH_PER_C"])
+        UA = float(cfg["UA_KW_PER_C"])
+        past_days = max(1, int(hours // 24) + 1)
+        if (self._reg_weather_pd != past_days
+                or time.time() - self._reg_weather_ts > 600):
+            weather = scheduler.fetch_forecast(
+                self._lat, self._lon, past_days=past_days, forecast_days=1)
+            self._reg_weather = weather
+            self._reg_weather_ts = time.time()
+            self._reg_weather_pd = past_days
+        else:
+            weather = self._reg_weather
+        heatmap = {0: False, 1: False, 2: True, 3: True, 4: False,
+                   5: True, 6: True, 7: True, 8: True}
+        out = []
+        prev = None
+        for r in rows:
+            s = r["shadow"]
+            try:
+                ht = int(s.get("heater_state") or 0)
+            except (TypeError, ValueError):
+                ht = 0
+            water = s.get("water_temperature")
+            kw = None
+            if prev is not None:
+                dt_s = r["ts"] - prev["ts"]
+                dt_h = dt_s / 3600.0
+                if 0.02 < dt_h <= 24:
+                    pw, cw = (prev.get("shadow") or {}).get("water_temperature"), water
+                    if isinstance(pw, (int, float)) and isinstance(cw, (int, float)):
+                        dT = cw - pw
+                        T_avg = (cw + pw) / 2.0
+                        t_amb = None
+                        e = weather.get(r["ts"] - r["ts"] % 3600)
+                        if e:
+                            t_amb = e[0]
+                        if heatmap.get(ht):
+                            k = (C * dT / dt_h +
+                                 (UA * (T_avg - t_amb) if isinstance(t_amb, (int, float)) else 0.0))
+                            kw = max(0.0, k)
+                        elif isinstance(t_amb, (int, float)) and cw < pw:
+                            kw = -max(0.0, C * (-dT) / dt_h + UA * (T_avg - t_amb))
+            out.append({
+                "ts": r["ts"], "water": water, "heater": ht,
+                "b3": s.get("B3"), "on": bool(heatmap.get(ht)),
+                "kw": round(kw, 2) if kw is not None else None,
+            })
+            prev = r
+        return out
 
     # -- thermal model (automatic cooling-rate measurement) -----------------
     def _maybe_log_shadow(self, state):
@@ -806,8 +883,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
-        if path in ("/api/state", "/api/health", "/api/history", "/api/plan",
-                    "/api/scheduler", "/api/weather", "/api/log",
+        if path in ("/api/state", "/api/health", "/api/history", "/api/history/registers",
+                    "/api/plan", "/api/scheduler", "/api/weather", "/api/log",
                     "/api/location/search"):
             self._api(path)
         elif path == "/api/events":
@@ -878,6 +955,17 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError:
                 limit = 100
             self._send_json(200, {"entries": app.get_log(max(1, min(limit, LOG_FILE_MAX)))})
+        elif path == "/api/history/registers":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                hours = float(qs.get("hours", ["168"])[0])
+            except ValueError:
+                hours = 168
+            try:
+                self._send_json(200, {"series": app._register_history(
+                    max(1, min(hours, 168)))})
+            except Exception as e:
+                self._send_json(502, {"error": str(e)})
         elif path == "/api/location/search":
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             query = (qs.get("q") or [""])[0]

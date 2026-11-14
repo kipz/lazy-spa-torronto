@@ -243,6 +243,7 @@ class SpaServer:
                      % (cfg.mode, cfg.scheduler_cfg["WINDOW"],
                         int(cfg.scheduler_cfg["TARGET_TEMP"])))
         self._telegram_poller()  # two-way bot commands if telegram.env set
+        self._seed_history_from_log()  # don't wipe the history view on restart
 
     # -- state -----------------------------------------------------------
     def update_state(self, state):
@@ -279,6 +280,47 @@ class SpaServer:
         cutoff = int(time.time()) - int(hours * 3600)
         with self._lock:
             return [dict(h) for h in self._history if h["ts"] >= cutoff]
+
+    def _seed_history_from_log(self):
+        """Backfill the in-memory history from the persisted shadow log.
+
+        The history chart used to only keep samples from the current process,
+        so a restart wiped the view. Pre-load the last HISTORY_SECONDS of
+        water/target/heater/power from shadow_log.jsonl so the chart shows real
+        data immediately and survives restarts (ambient is backfilled live).
+        """
+        path = os.path.join(BASE_DIR, "shadow_log.jsonl")
+        if not os.path.exists(path):
+            return
+        rows = []
+        try:
+            with open(path) as f:
+                for line in f:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        pass
+        except OSError:
+            return
+        rows.sort(key=lambda r: r["ts"])
+        cutoff = int(time.time()) - HISTORY_SECONDS
+        hist = []
+        for r in rows:
+            if r["ts"] < cutoff:
+                continue
+            s = r.get("shadow") or {}
+            hist.append({
+                "ts": r["ts"],
+                "water": s.get("water_temperature"),
+                "target": s.get("temperature_setting"),
+                "heater": s.get("heater_state"),
+                "power": s.get("power_state"),
+                "ambient": None,
+            })
+        if hist:
+            with self._lock:
+                if not self._history:
+                    self._history = hist
 
     def _register_history(self, hours):
         """Raw register history from shadow_log.jsonl + derived heater kW.

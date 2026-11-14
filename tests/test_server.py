@@ -169,6 +169,20 @@ class TestSpaServer(unittest.TestCase):
         self.assertEqual(model["ua_samples"], 3)
         self.assertAlmostEqual(model["UA_KW_PER_C"], 0.0308, delta=0.002)
 
+    def test_history_seeded_from_shadow_log(self):
+        base = int(time.time())
+        with open(os.path.join(self.tmp.name, "shadow_log.jsonl"), "w") as f:
+            for i in range(10):
+                f.write(json.dumps({"ts": base - (9 - i) * 300,
+                                    "shadow": {"water_temperature": 39 + (i % 2),
+                                               "temperature_setting": 40,
+                                               "heater_state": 6, "power_state": 1}},
+                                   separators=(",", ":")) + "\n")
+        self.app._seed_history_from_log()
+        hist = self.app.get_history(1)
+        self.assertGreaterEqual(len(hist), 9)
+        self.assertEqual(hist[0]["water"] if hist else None, 39)
+
     def test_register_history_derives_heater_kw(self):
         base = int(time.time()) - (int(time.time()) % 3600)
         rows = [

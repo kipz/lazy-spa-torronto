@@ -306,6 +306,7 @@ class SpaServer:
         cfg = self.cfg.scheduler_cfg
         C = float(cfg["C_KWH_PER_C"])
         UA = float(cfg["UA_KW_PER_C"])
+        P = float(cfg.get("P_HEAT_KW") or 2.0)
         past_days = max(1, int(hours // 24) + 1)
         if (self._reg_weather_pd != past_days
                 or time.time() - self._reg_weather_ts > 600):
@@ -318,8 +319,10 @@ class SpaServer:
             weather = self._reg_weather
         heatmap = {0: False, 1: False, 2: True, 3: True, 4: False,
                    5: True, 6: True, 7: True, 8: True}
+        cap = P * 1.1                       # heater can't exceed ~its rating
+        min_spread = 1800                   # pair ~30 min apart to smooth 1C res
         out = []
-        prev = None
+        buf = []                            # recent (ts, water)
         for r in rows:
             s = r["shadow"]
             try:
@@ -327,31 +330,36 @@ class SpaServer:
             except (TypeError, ValueError):
                 ht = 0
             water = s.get("water_temperature")
+            on = bool(heatmap.get(ht))
             kw = None
-            if prev is not None:
-                dt_s = r["ts"] - prev["ts"]
-                dt_h = dt_s / 3600.0
-                if 0.02 < dt_h <= 24:
-                    pw, cw = (prev.get("shadow") or {}).get("water_temperature"), water
-                    if isinstance(pw, (int, float)) and isinstance(cw, (int, float)):
-                        dT = cw - pw
-                        T_avg = (cw + pw) / 2.0
-                        t_amb = None
-                        e = weather.get(r["ts"] - r["ts"] % 3600)
-                        if e:
-                            t_amb = e[0]
-                        if heatmap.get(ht):
-                            k = (C * dT / dt_h +
-                                 (UA * (T_avg - t_amb) if isinstance(t_amb, (int, float)) else 0.0))
-                            kw = max(0.0, k)
-                        elif isinstance(t_amb, (int, float)) and cw < pw:
-                            kw = -max(0.0, C * (-dT) / dt_h + UA * (T_avg - t_amb))
+            ref = None
+            for b in buf:
+                if r["ts"] - b["ts"] >= min_spread:
+                    ref = b
+            if (ref is not None and isinstance(ref["water"], (int, float))
+                    and isinstance(water, (int, float))):
+                dt_h = (r["ts"] - ref["ts"]) / 3600.0
+                if 0.1 <= dt_h <= 24:
+                    dT = water - ref["water"]
+                    T_avg = (water + ref["water"]) / 2.0
+                    t_amb = None
+                    e = weather.get(r["ts"] - r["ts"] % 3600)
+                    if e:
+                        t_amb = e[0]
+                    if on:
+                        k = C * dT / dt_h + (
+                            UA * (T_avg - t_amb) if isinstance(t_amb, (int, float)) else 0.0)
+                        kw = max(0.0, min(k, cap))
+                    elif isinstance(t_amb, (int, float)) and dT < 0:
+                        kw = -min(cap, max(0.0, C * (-dT) / dt_h + UA * (T_avg - t_amb)))
+            buf.append({"ts": r["ts"], "water": water})
+            if len(buf) > 60:
+                buf.pop(0)
             out.append({
                 "ts": r["ts"], "water": water, "heater": ht,
-                "b3": s.get("B3"), "on": bool(heatmap.get(ht)),
+                "b3": s.get("B3"), "on": on,
                 "kw": round(kw, 2) if kw is not None else None,
             })
-            prev = r
         return out
 
     # -- thermal model (automatic cooling-rate measurement) -----------------

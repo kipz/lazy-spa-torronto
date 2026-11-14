@@ -158,34 +158,38 @@ field's **byte offset / size in the binary protocol packet**, its data type,
 and its R/W class. This is the authoritative packet layout (byte 0 = first
 packet byte after the header):
 
-| Byte | Name | Size | Type | R/W | Manufacturer meaning | Units / notes |
-|---|---|---|---|---|---|---|
-| 0.0 | `power_state` | 1 bit | bool | **W** | master power | 0 off / 1 on |
-| 0.1 | `temperature_unit` | 1 bit | bool | **W** | display unit | 0 = °F, 1 = °C |
-| 1 | `heater_state` | 1 | uint8 | **W** | heater | 0 off, 3 heating, 4-6 holding... (see table above) |
-| 2 | `wave_state` | 1 | uint8 | **W** | AirJet | 0 off / 1–99 speed-2 / 100 speed-1 |
-| 3 | `filter_state` | 1 | uint8 | **W** | filter pump | 0 off / 1 starting / 2 running / 3 wait-24h |
-| 4 | `temperature_setting` | 1 | uint8 | **W** | target setpoint | 20–40 °C / 68–104 °F |
-| 5 | `hydrojet_state` | 1 | uint8 | **W** | HydroJet | 0 off / 1 on |
-| 6 | `local_timer_rest` | 2 | uint16 | **W** | timer | hours; 0 = off |
-| 8 | `water_temperature` | 1 | uint8 | R | water temp | °C/F; 4–40 °C |
-| 9 | `warning` | 1 | uint8 | R | at-target flag | 0 none / 1 reached setpoint |
-| 10 | `error_code` | 1 | uint8 | R | error | 0 none / 1=E01 … 31=E31 |
-| 11 | `local_reservation` | 2 | uint16 | R | reservation | hours; 0 = off |
-| 13 | `B0` | 1 | byte | R | key code | last key/button |
-| 14 | `B1` | 1 | byte | R | NTC1 temp | thermistor 1; raw (reads ~°C) |
-| 15 | `B2` | 1 | byte | R | NTC2 temp | thermistor 2; raw (reads ~°C) |
-| 16 | `B3` | 1 | byte | R | pump current | motor current; raw (unit unconfirmed) |
-| 17–20 | `B4`–`B7` | 1 each | byte | R | *(undefined)* | — |
-| 21 | `B8` | 1 | byte | R | E18 leak ADC | leakage-current sample |
-| 22 | `B9` | 1 | byte | R | E19 PCB temp | board temperature; raw (reads ~°C) |
-| 23–28 | `B10`–`B15` (BA–BF) | 1 each | byte | R | *(undefined)* | — |
-| 29 | `W0` | 2 | uint16 | R | run time | filter-or-heating accumulated **hours** |
-| 31–43 | `W1`–`W7` | 2 each | uint16 | R | *(undefined)* | — |
-| 45 | `P0` | 4 | uint32 | R | bit flags | bit1 NTC1-change · bit2 NTC2-open · bit3 flow-switch · bit4 panel-lock |
-| 49 | `P1` | 4 | uint32 | R | power-board version | `A bb C MM DD` → 6.16.2 (built 01/09) |
-| 53 | `P2` | 4 | uint32 | R | display-board version | `A bb C MM DD` → 6.24.2 (built 04/09) |
-| 57–73 | `P3`–`P7` | 4 each | uint32 | R | *(undefined)* | — |
+    packet byte after the header):
+
+Live values sampled 2026-11-14 (AUTO eco, water coasting from 40 °C); registers not reported by this pump's shadow are shown as —.
+
+| Byte | Name | Size | Type | Live | R/W | Manufacturer meaning | Units / notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.0 | `power_state` | 1 bit | bool | 1 | **W** | master power | 0 off / 1 on |
+| 0.1 | `temperature_unit` | 1 bit | bool | 1 | **W** | display unit | 0 = °F, 1 = °C |
+| 1 | `heater_state` | 1 | uint8 | 0 | **W** | heater | 0 off, 3 heating, 4-6 holding... (see table above) |
+| 2 | `wave_state` | 1 | uint8 | 0 | **W** | AirJet | 0 off / 1–99 speed-2 / 100 speed-1 |
+| 3 | `filter_state` | 1 | uint8 | 2 | **W** | filter pump | 0 off / 1 starting / 2 running / 3 wait-24h |
+| 4 | `temperature_setting` | 1 | uint8 | 28 | **W** | target setpoint | 20–40 °C / 68–104 °F |
+| 5 | `hydrojet_state` | 1 | uint8 | 0 | **W** | HydroJet | 0 off / 1 on |
+| 6 | `local_timer_rest` | 2 | uint16 | 0 | **W** | timer | hours; 0 = off |
+| 8 | `water_temperature` | 1 | uint8 | 40 | R | water temp | °C/F; 4–40 °C |
+| 9 | `warning` | 1 | uint8 | “” | R | at-target flag | 0 none / 1 reached setpoint |
+| 10 | `error_code` | 1 | uint8 | “” | R | error | 0 none / 1=E01 … 31=E31 |
+| 11 | `local_reservation` | 2 | uint16 | 0 | R | reservation | hours; 0 = off |
+| 13 | `B0` | 1 | byte | 228 | R | key code | last key/button |
+| 14 | `B1` | 1 | byte | 41 | R | NTC1 temp | thermistor 1; raw (reads ~°C) |
+| 15 | `B2` | 1 | byte | 41 | R | NTC2 temp | thermistor 2; raw (reads ~°C) |
+| 16 | `B3` | 1 | byte | 43 | R | pump current | motor current; raw (unit unconfirmed) |
+| 17–20 | `B4`–`B7` | 1 each | byte | — | R | *(undefined)* | — |
+| 21 | `B8` | 1 | byte | 0 | R | E18 leak ADC | leakage-current sample |
+| 22 | `B9` | 1 | byte | 41 | R | E19 PCB temp | board temperature; raw (reads ~°C) |
+| 23–28 | `B10`–`B15` (BA–BF) | 1 each | byte | — | R | *(undefined)* | — |
+| 29 | `W0` | 2 | uint16 | 5 | R | run time | filter-or-heating accumulated **hours** |
+| 31–43 | `W1`–`W7` | 2 each | uint16 | — | R | *(undefined)* | — |
+| 45 | `P0` | 4 | uint32 | 901100 | R | bit flags | bit1 NTC1-change · bit2 NTC2-open · bit3 flow-switch · bit4 panel-lock |
+| 49 | `P1` | 4 | uint32 | 61620109 | R | power-board version | `A bb C MM DD` → 6.16.2 (built 01/09) |
+| 53 | `P2` | 4 | uint32 | 62420409 | R | display-board version | `A bb C MM DD` → 6.24.2 (built 04/09) |
+| 57–73 | `P3`–`P7` | 4 each | uint32 | — | R | *(undefined)* | — |
 
 **R/W via the cloud — confirmed:** only the 8 `status_writable` datapoints
 (`power_state`, `temperature_unit`, `heater_state`, `wave_state`,

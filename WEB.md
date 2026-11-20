@@ -24,7 +24,7 @@ Open `http://<host>:8080/` in a browser.
 | **Feedback** | Command progress modal (sent → confirmed by status), AUTO lock hints, and a live operation log |
 | **Forecast** | Multi-day (3d/7d) ambient forecast cards + a plan chart overlaying projected water temperature, heater-on blocks and window/preheat shading on the weather timeline |
 | **Weather** | Next-24 h forecast fact + ambient in chart/facts |
-| **Smart plug** | Relay on/off + live power (W) for the mains and lights plugs, today's kWh + £ cost from the mains meter, with a watts sparkline; Telegram alerts on relay toggles |
+| **Smart plug** | Relay on/off + live power (W) for the mains and lights plugs, today's kWh + £ cost from the mains meter, with a watts sparkline; optional (off by default) Telegram alerts on relay toggles |
 
 ## Modes
 
@@ -114,8 +114,10 @@ the Smart Life app (session persisted to `tuya.session.json`, gitignored).
 The poller queries them every `PLUG_POLL` seconds (default 30) and surfaces
 each plug's relay state, `cur_power`/`cur_voltage`/`cur_current`/`fault`, and
 online status; the mains plug's wattage is integrated into a kWh counter reset
-at local midnight. When a plug's relay toggles on/off, a Telegram message is
-sent (via the existing `telegram.env` bot). Plugs are strictly read-only —
+at local midnight. Optional Telegram alerts on relay toggles are **off by
+default** (set `PLUG_NOTIFY=1` to enable; a change must then hold for two
+consecutive polls and respect `PLUG_NOTIFY_COOLDOWN`, so flaky cloud reads
+cannot spam "plug is now ON/OFF" messages). Plugs are strictly read-only —
 there is deliberately no way to switch them from the UI. See `plug.py` for the
 one-time setup.
 

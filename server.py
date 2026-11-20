@@ -32,6 +32,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 POLL_SECONDS = 15.0
 PLUG_POLL_SECONDS = 15.0           # smart-plug (Tuya cloud) poll cadence
+# Plug relay-toggle Telegram alerts are opt-in (PLUG_NOTIFY=1). Even when
+# enabled, a relay change must be seen consistently for two consecutive polls
+# and at least the cooldown after the previous alert — flaky cloud reads (the
+# switch briefly reading off then back on) otherwise spam "plug is now ON".
+PLUG_NOTIFY_CONFIRM = 2
+PLUG_NOTIFY_COOLDOWN_S = 600
 HISTORY_SECONDS = 7 * 86400        # keep ~1 week of history in memory
 PLUG_HISTORY_SECONDS = 7 * 86400   # keep ~1 week of plug power samples
 PLUG_LOG_FILE = "plug_log.jsonl"   # durable plug power samples (gitignored)
@@ -258,6 +264,16 @@ class WebConfig:
             self.plug_poll = float(env.get("PLUG_POLL", PLUG_POLL_SECONDS))
         except (TypeError, ValueError):
             self.plug_poll = PLUG_POLL_SECONDS
+        # Plug relay-toggle Telegram alerts: OFF unless explicitly PLUG_NOTIFY=1
+        # (the user reported these as spam). When enabled, changes still have
+        # to pass the two-poll confirmation + cooldown in _maybe_notify_plug_change.
+        self.plug_notify = str(env.get("PLUG_NOTIFY", "0")).strip().lower() \
+            in ("1", "true", "yes", "on")
+        try:
+            self.plug_notify_cooldown = float(
+                env.get("PLUG_NOTIFY_COOLDOWN", PLUG_NOTIFY_COOLDOWN_S))
+        except (TypeError, ValueError):
+            self.plug_notify_cooldown = PLUG_NOTIFY_COOLDOWN_S
         # scheduler config (shared with scheduler.env values where present)
         self.scheduler_cfg = scheduler.load_config()
 
@@ -295,7 +311,10 @@ class SpaServer:
         self._log_lock = threading.Lock()
         # smart plug (Tuya cloud) state
         self._plugs = {}             # device_id -> latest normalised reading
-        self._plug_prev_state = {}   # device_id -> previous switch_on (notify)
+        # Relay-toggle alert state: a change must be seen on two consecutive
+        # polls (`_plug_pending`), and alerts are per-device cooldown-limited.
+        self._plug_pending = {}       # device_id -> {on, confirmed}
+        self._plug_last_notify = {}   # device_id -> last alert timestamp
         self._plug_hist = []         # [{ts, watts, on, fault}] power samples
         self._plug_kwh_today = 0.0   # integrated energy since local midnight
         self._plug_kwh_day = None    # 'YYYY-MM-DD' the accumulator covers
@@ -504,14 +523,36 @@ class SpaServer:
                 self._plug_prev_ts = float(hist[-1]["ts"])
 
     def _maybe_notify_plug_change(self, reading):
-        """Send a Telegram alert when a plug relay toggles on/off."""
-        dev_id = reading.get("device_id")
-        name = reading.get("device")
-        on = bool(reading.get("switch_on"))
-        prev = self._plug_prev_state.get(dev_id)
-        self._plug_prev_state[dev_id] = on
-        if prev is None or prev == on or not notify.configured():
+        """Send a Telegram alert when a plug relay toggles — opt-in and debounced.
+
+        Opt-in via ``PLUG_NOTIFY=1`` (default off; the user reported these
+        notifications as spam). Even when enabled, the new state must be seen
+        for ``PLUG_NOTIFY_CONFIRM`` consecutive polls *and* at least
+        ``cfg.plug_notify_cooldown`` seconds must have passed since the last
+        alert for that device. A brief read glitch (switch off for one poll,
+        back on) therefore never produces a message.
+        """
+        if not getattr(self.cfg, "plug_notify", False):
             return
+        dev_id = reading.get("device_id")
+        if not dev_id:
+            return
+        on = bool(reading.get("switch_on"))
+        now = time.time()
+        pend = self._plug_pending.get(dev_id)
+        if pend is None or pend["on"] != on:
+            # first sighting, or the reading changed since last poll: restart
+            # the confirmation count and wait for the state to hold.
+            self._plug_pending[dev_id] = {"on": on, "confirmed": 1}
+            return
+        pend["confirmed"] += 1
+        last = self._plug_last_notify.get(dev_id, 0.0)
+        if pend["confirmed"] < PLUG_NOTIFY_CONFIRM \
+                or now - last < self.cfg.plug_notify_cooldown:
+            return
+        if not notify.configured():
+            return
+        name = reading.get("device")
         label = "ON" if on else "OFF"
         msg = ("<b>Torronto</b> \U0001F50C · <b>%s</b> plug is now <b>%s</b>"
                % (name, label))
@@ -519,6 +560,8 @@ class SpaServer:
         self.add_log("ok" if ok else "warn",
                      "Plug %s → %s (%s)"
                      % (name, label, "sent" if ok else "failed: " + err))
+        self._plug_last_notify[dev_id] = now
+        self._plug_pending[dev_id] = {"on": on, "confirmed": 1}
 
     def _roll_plug_day(self, now=None):
         """Start a fresh kWh accumulator when the local day changes."""

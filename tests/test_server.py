@@ -34,6 +34,8 @@ def _spa_app(cfg):
     """Build a real SpaServer with real side effects disabled so the unit
     suite stays hermetic: no Telegram bot poll thread (telegram.env is present
     in the repo), no real web.env read, nothing hitting the network."""
+    cfg.plug_notify = False                 # opt-in relay alerts stay off
+    cfg.plug_notify_cooldown = 0.0
     with mock.patch.object(server.notify, "configured", return_value=False), \
          mock.patch.object(server.scheduler, "load_env", return_value={}):
         return server.SpaServer(cfg)
@@ -195,6 +197,8 @@ class TestSpaServer(unittest.TestCase):
 
     def test_plug_readings_energy_and_notify(self):
         app = self.app
+        app.cfg.plug_notify = False          # the opt-in default
+        app.cfg.plug_notify_cooldown = 0.0
         mains = {"device": "Tub mains", "device_id": "plug-mains",
                  "switch_on": False, "watts": 0.0, "voltage_v": 239.8,
                  "current_a": 0.0, "fault": 0, "online": True}
@@ -222,13 +226,57 @@ class TestSpaServer(unittest.TestCase):
         ]
         self.assertAlmostEqual(app.plug_kwh_window(24),
                                2000.0 / 1000.0 * (60.0 / 3600.0), delta=0.0001)
-        # lights relay toggles -> Telegram notification
+        # lights relay toggles -> Telegram notification (opt-in: PLUG_NOTIFY=1,
+        # and only after the state holds for two consecutive polls)
+        self.app.cfg.plug_notify = True
+        self.app.cfg.plug_notify_cooldown = 0.0
         with mock.patch.object(server.notify, "configured", return_value=True), \
              mock.patch.object(server.notify, "send_text",
                                return_value=(True, "")) as send:
-            app.update_plug(dict(lights, switch_on=True))
+            app.update_plug(dict(lights, switch_on=True))   # first sighting
+            app.update_plug(dict(lights, switch_on=True))   # confirmed -> alert
         send.assert_called_once()
         self.assertIn("Tub lights", send.call_args[0][0])
+
+    def test_plug_relay_alerts_off_by_default_and_debounced(self):
+        # The user reported plug relay alerts as spam: PLUG_NOTIFY defaults to
+        # off, so a real toggle must never notify without an explicit enable.
+        app = self.app
+        app.cfg.plug_notify = False            # the opt-in default
+        app.cfg.plug_notify_cooldown = 0.0
+        lights = {"device": "Tub lights", "device_id": "plug-lights",
+                  "switch_on": False, "watts": 0.0, "voltage_v": 239.8,
+                  "current_a": 0.0, "fault": 0, "online": True}
+        with mock.patch.object(server.notify, "configured", return_value=True), \
+             mock.patch.object(server.notify, "send_text",
+                               return_value=(True, "")) as send:
+            for _ in range(5):
+                app.update_plug(dict(lights, switch_on=True))
+        send.assert_not_called()          # feature off by default
+        # With debounce but cooldown, a one-poll glitch (OFF -> ON -> OFF) is
+        # never reported; a held ON is, but only if the cooldown has passed.
+        self.app.cfg.plug_notify = True
+        self.app.cfg.plug_notify_cooldown = 3600.0
+        with mock.patch.object(server.notify, "configured", return_value=True), \
+             mock.patch.object(server.notify, "send_text",
+                               return_value=(True, "")) as send:
+            # True False True True -> first confirmed ON alerts (no prior alert)
+            for on in (True, False, True, True):
+                app.update_plug(dict(lights, switch_on=on))
+            send.assert_called_once()
+            # ...but a second held toggle within the 1 h cooldown does not
+            for on in (False, True, True):
+                app.update_plug(dict(lights, switch_on=on))
+            send.assert_called_once()         # cooldown respected
+        # A held toggle (OFF -> ON -> ON) with a zero cooldown reports exactly
+        # once, only after the second consecutive ON poll.
+        self.app.cfg.plug_notify_cooldown = 0.0
+        with mock.patch.object(server.notify, "configured", return_value=True), \
+             mock.patch.object(server.notify, "send_text",
+                               return_value=(True, "")) as send:
+            for on in (False, True, True):
+                app.update_plug(dict(lights, switch_on=on))
+        send.assert_called_once()
 
     def test_plug_history_persists_across_restart(self):
         app = self.app

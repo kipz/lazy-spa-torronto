@@ -14,6 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, ".")
 import server  # noqa: E402
+import spa  # noqa: E402
 
 
 class FakeState(dict):
@@ -27,6 +28,15 @@ def _shadow():
         "wave_state": 0, "hydrojet_state": 0, "warning": "1",
         "error_code": "", "ConnectType": "online", "wifivertion": 121,
     }
+
+
+def _spa_app(cfg):
+    """Build a real SpaServer with real side effects disabled so the unit
+    suite stays hermetic: no Telegram bot poll thread (telegram.env is present
+    in the repo), no real web.env read, nothing hitting the network."""
+    with mock.patch.object(server.notify, "configured", return_value=False), \
+         mock.patch.object(server.scheduler, "load_env", return_value={}):
+        return server.SpaServer(cfg)
 
 
 class TestHeaterStatus(unittest.TestCase):
@@ -76,16 +86,69 @@ class TestHeaterStatus(unittest.TestCase):
         self.assertEqual(server.heater_status(st), "frost-watch")
 
     def test_state_endpoint_carries_heater(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(setattr, server, "BASE_DIR", server.BASE_DIR)
+        server.BASE_DIR = tmp.name
         cfg = mock.MagicMock()
         cfg.mode = "manual"
         cfg.scheduler_cfg = _scheduler_cfg()
-        with mock.patch.object(server.scheduler, "load_env", return_value={}):
-            app = server.SpaServer(cfg)
+        app = _spa_app(cfg)
         app.update_state({**_shadow(), "water_temperature": 40,
                           "temperature_setting": 28, "heater_state": 4})
         # exercise the payload builder directly
         state, _ = app.get_state()
         self.assertEqual(server.heater_status(state), "cooling")
+
+
+class TestTubConnectivity(unittest.TestCase):
+    """Offline/staleness handling surfaced by the server."""
+
+    def _app(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(setattr, server, "BASE_DIR", server.BASE_DIR)
+        server.BASE_DIR = self.tmp.name
+        cfg = mock.MagicMock()
+        cfg.mode = "auto"
+        cfg.scheduler_cfg = _scheduler_cfg()
+        return _spa_app(cfg)
+
+    def test_heater_status_offline(self):
+        st = _shadow()
+        st.update({"is_online": False, "ConnectType": "offline", "heater_state": 6})
+        self.assertEqual(server.heater_status(st), "offline")
+
+    def test_tub_online_fresh_shadow(self):
+        app = self._app()
+        with mock.patch.object(server.time, "time", return_value=1_800_000_000):
+            app.update_state({**_shadow(), "is_online": True})
+        self.assertTrue(app.tub_online())
+
+    def test_tub_offline_when_device_reports_offline(self):
+        app = self._app()
+        with mock.patch.object(server.time, "time", return_value=1_800_000_000):
+            app.update_state({**_shadow(), "is_online": False, "ConnectType": "offline"})
+        self.assertFalse(app.tub_online())
+
+    def test_tub_offline_when_shadow_stale(self):
+        app = self._app()
+        with mock.patch.object(server.time, "time", return_value=1_800_000_000):
+            app.update_state({**_shadow(), "is_online": True})
+        with mock.patch.object(server.time, "time",
+                               return_value=1_800_000_000 + server.STATE_STALE_SECONDS * 2):
+            self.assertFalse(app.tub_online())
+
+    def test_offline_transition_logs_and_notifies(self):
+        app = self._app()
+        with mock.patch.object(server.notify, "configured", return_value=True), \
+             mock.patch.object(server.notify, "send_text", return_value=(True, "")) as send, \
+             mock.patch.object(server.time, "time", return_value=1_800_000_000):
+            app.update_state({**_shadow(), "is_online": True})
+            app.update_state({**_shadow(), "is_online": False, "ConnectType": "offline"})
+        send.assert_called_once()
+        msgs = [e["msg"] for e in app.get_log(50)]
+        self.assertTrue(any("Tub OFFLINE" in m for m in msgs), msgs)
 
 
 class TestWebConfig(unittest.TestCase):
@@ -121,8 +184,7 @@ class TestSpaServer(unittest.TestCase):
         cfg = mock.MagicMock()
         cfg.mode = "manual"
         cfg.scheduler_cfg = _scheduler_cfg()
-        with mock.patch.object(server.scheduler, "load_env", return_value={}):
-            self.app = server.SpaServer(cfg)
+        self.app = _spa_app(cfg)
 
     def test_update_state_appends_history(self):
         self.app.update_state(_shadow())
@@ -130,6 +192,83 @@ class TestSpaServer(unittest.TestCase):
         self.assertEqual(len(hist), 1)
         self.assertEqual(hist[0]["water"], 39)
         self.assertIsNone(hist[0]["ambient"])
+
+    def test_plug_readings_energy_and_notify(self):
+        app = self.app
+        mains = {"device": "Tub mains", "device_id": "plug-mains",
+                 "switch_on": False, "watts": 0.0, "voltage_v": 239.8,
+                 "current_a": 0.0, "fault": 0, "online": True}
+        lights = {"device": "Tub lights", "device_id": "plug-lights",
+                  "switch_on": False, "watts": 0.0, "voltage_v": 239.8,
+                  "current_a": 0.0, "fault": 0, "online": True}
+        app.update_plug(dict(mains))
+        app.update_plug(dict(lights))
+        plugs, kwh = app.get_plugs()
+        self.assertIn("plug-mains", plugs)
+        self.assertIn("plug-lights", plugs)
+        self.assertEqual(plugs["plug-lights"]["device"], "Tub lights")
+        # 2000 W for 1 s -> ~0.0006 kWh, integrated only for the meter
+        app._plug_prev_ts = time.time() - 1
+        app.update_plug(dict(mains, switch_on=True, watts=2000.0))
+        _, kwh = app.get_plugs()
+        self.assertGreater(kwh, 0.0)
+        self.assertLess(kwh, 0.01)
+        # mains samples are recorded from the very first read (sparkline seed)
+        self.assertEqual(len(app.get_plug_history(24)), 2)
+        # measured window kWh (real-draw basis for cost): 2 kW for 60 s
+        app._plug_hist = [
+            {"ts": int(time.time()) - 120, "watts": 2000.0, "on": True, "fault": 0},
+            {"ts": int(time.time()) - 60, "watts": 2000.0, "on": True, "fault": 0},
+        ]
+        self.assertAlmostEqual(app.plug_kwh_window(24),
+                               2000.0 / 1000.0 * (60.0 / 3600.0), delta=0.0001)
+        # lights relay toggles -> Telegram notification
+        with mock.patch.object(server.notify, "configured", return_value=True), \
+             mock.patch.object(server.notify, "send_text",
+                               return_value=(True, "")) as send:
+            app.update_plug(dict(lights, switch_on=True))
+        send.assert_called_once()
+        self.assertIn("Tub lights", send.call_args[0][0])
+
+    def test_plug_history_persists_across_restart(self):
+        app = self.app
+        mains = {"device": "Tub mains", "device_id": "plug-mains",
+                 "switch_on": True, "watts": 2000.0, "voltage_v": 239.8,
+                 "current_a": 8.0, "fault": 0, "online": True}
+        # two reads -> the power sample is persisted to plug_log.jsonl
+        app.update_plug(dict(mains))
+        app.update_plug(dict(mains))
+        path = os.path.join(self.tmp.name, server.PLUG_LOG_FILE)
+        self.assertTrue(os.path.exists(path))
+        with open(path) as f:
+            rows = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual(len(rows), 2)
+        # simulate a restart: a fresh SpaServer over the same dir reloads them
+        cfg = mock.MagicMock()
+        cfg.mode = "manual"
+        cfg.scheduler_cfg = _scheduler_cfg()
+        with mock.patch.object(server.scheduler, "load_env", return_value={}):
+            app2 = _spa_app(cfg)
+        self.assertEqual(len(app2._plug_hist), 2)
+        self.assertEqual(app2._plug_hist[0]["watts"], 2000.0)
+
+    def test_plug_history_seed_integrates_measured_kwh(self):
+        # 2 kW for a full minute, persisted at boot -> 7-day window reflects it
+        base = int(time.time()) - 120
+        with open(os.path.join(self.tmp.name, server.PLUG_LOG_FILE), "w") as f:
+            for ts in (base, base + 60):
+                f.write(json.dumps({"ts": ts, "watts": 2000.0,
+                                    "on": True, "fault": 0}) + "\n")
+        cfg = mock.MagicMock()
+        cfg.mode = "manual"
+        cfg.scheduler_cfg = _scheduler_cfg()
+        with mock.patch.object(server.scheduler, "load_env", return_value={}):
+            app2 = _spa_app(cfg)
+        self.assertAlmostEqual(
+            app2.plug_kwh_window(168), 2000.0 / 1000.0 * (60.0 / 3600.0), places=4)
+        payload = server.scheduler_payload(app2)
+        self.assertIn("measured_kwh_7d", payload)
+        self.assertGreater(payload["measured_kwh_7d"], 0.0)
 
     def test_update_state_persists_shadow_log(self):
         self.app.update_state(_shadow())
@@ -166,8 +305,53 @@ class TestSpaServer(unittest.TestCase):
         with open(path) as f:
             model = json.load(f)
         self.assertEqual(model["source"], "online coast-down")
-        self.assertEqual(model["ua_samples"], 3)
+        # model last updated on the 2nd sample (UA_MIN_SAMPLES=2); the third
+        # is within tolerance so no re-save happened -> record says 2 samples
+        self.assertEqual(model["ua_samples"], 2)
         self.assertAlmostEqual(model["UA_KW_PER_C"], 0.0308, delta=0.002)
+
+    def test_register_telemetry_logs_probe_offsets(self):
+        app = self.app
+        base = 1_800_000_000
+        clock = {"now": base}
+        def tick(state):
+            clock["now"] += 60
+            with mock.patch.object(server.time, "time", lambda: clock["now"]):
+                app._monitor_registers(state)
+        tick({"water_temperature": 40})                 # no probes yet
+        for _ in range(8):                              # build offset baselines
+            tick({"water_temperature": 40, "B1": 41, "B2": 41, "B9": 40})
+        self.assertEqual(app._reg_offsets,
+                         {"B1": 1.0, "B2": 1.0, "B9": 0.0})
+        # let the hourly summary fire and check it appears in the op log
+        app._reg_mon_ts = clock["now"] - 7200
+        with mock.patch.object(server.time, "time", lambda: clock["now"]):
+            app._monitor_registers({"water_temperature": 40,
+                                    "B1": 41, "B2": 41, "B9": 40})
+        msgs = [e["msg"] for e in app.get_log(60)]
+        self.assertTrue(any(m.startswith("registers:") for m in msgs), msgs)
+        self.assertTrue(any("B1+1.0" in m and "B2+1.0" in m for m in msgs), msgs)
+
+    def test_ua_learns_held_temp_as_upper_bound(self):
+        # A well-insulated tub can hold the same integer degree for hours.
+        # That "no drop" is still evidence of low heat loss: it must produce
+        # an upper-bound sample (0.5 C assumed drop), not be dismissed.
+        base = 1_800_000_000            # aligned to the hour
+        self.app._amb = {base + h * 3600: 5.0 for h in range(4)}
+        self.app.cfg.scheduler_cfg["UA_KW_PER_C"] = 0.03
+        clock = {"now": base}
+        with mock.patch.object(server.time, "time", lambda: clock["now"]):
+            self.app._maybe_sample_ua({
+                "water_temperature": 40, "temperature_setting": 28,
+                "power_state": 1, "heater_state": 0})       # anchor at +0h
+            clock["now"] = base + 3600
+            self.app._maybe_sample_ua({
+                "water_temperature": 40, "temperature_setting": 28,
+                "power_state": 1, "heater_state": 0})       # held at 40
+        self.assertEqual(len(self.app._ua_samples), 1)
+        C = self.app.cfg.scheduler_cfg["C_KWH_PER_C"]
+        expected = C * 0.5 / 1.0 / 35.0   # dT_res/1h / (T-amb)
+        self.assertAlmostEqual(self.app._ua_samples[-1], expected, delta=0.0005)
 
     def test_history_seeded_from_shadow_log(self):
         base = int(time.time())
@@ -307,6 +491,176 @@ class TestSpaServer(unittest.TestCase):
         self.assertIn("month", s)
         self.assertIn("0.2263", s)
 
+    def test_tg_cost_leads_with_measured_plug_and_offline_warning(self):
+        # Measured plug kWh is the ground truth; a stale plan / offline tub
+        # must be labelled instead of being presented as a hard monthly bill.
+        now = int(time.time()) - (int(time.time()) % 3600)
+        self.app._plan = {"phase": "eco", "energy_kwh": 4.0,
+                          "energy_alwayson_kwh": 10.0,
+                          "plan_ts": [now + i * 3600 for i in range(24 * 7)]}
+        self.app.cfg.scheduler_cfg["PRICE_PER_KWH"] = 0.2263
+        with mock.patch.object(self.app, "plug_enabled", return_value=True), \
+             mock.patch.object(self.app, "plug_kwh_window", return_value=5.0):
+            s = self.app._tg_command("/cost")
+        self.assertIn("measured (plug) 24h: 5.00 kWh", s)
+        self.assertIn("measured (plug) 7d : 5.00 kWh", s)
+        # no fresh plan / tub offline -> projections flagged as estimates
+        self.assertIn("estimate", s)
+        self.assertIn("month", s)
+
+    def test_poller_survives_system_exit(self):
+        # A stray SystemExit from a cloud call must not kill the poller loop
+        # (this was the incident: an expired token made spa.shadow() raise
+        # SystemExit, which silently stopped monitoring + auto-heating).
+        import threading
+        app = mock.MagicMock()
+        app._get_tokens.return_value = {"t": 1}
+        app.cfg.mode = "manual"
+        app.plug_enabled.return_value = False
+        app.refresh_plan.side_effect = lambda **kw: None
+        app._plug_next = 0.0
+        state = {"water_temperature": 39, "is_online": True}
+        calls = {"n": 0}
+
+        def flaky_shadow(tokens):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise SystemExit("thing_shadow failed: Token is not authorized")
+            return state
+
+        stop = threading.Event()
+        with mock.patch.object(server.spa, "shadow", side_effect=flaky_shadow), \
+             mock.patch.object(server, "POLL_SECONDS", 0.02):
+            t = threading.Thread(target=server._poller_loop, args=(app, stop), daemon=True)
+            t.start()
+            time.sleep(0.15)
+            stop.set()
+            t.join(2)
+        self.assertFalse(t.is_alive())
+        self.assertGreaterEqual(app.update_state.call_count, 1)
+        logged = [a for a in app.add_log.call_args_list]
+        self.assertTrue(any("exited" in str(a) for a in logged), logged)
+
+    def test_poller_self_heals_revoked_token(self):
+        # When the cloud rejects the token, the poller must not stop: it drops
+        # the cached token (so `python3 spa.py login` is picked up without a
+        # restart), alerts via Telegram once, and resumes on the next poll.
+        import threading
+        app = mock.MagicMock()
+        app._get_tokens.side_effect = [{"t": 1}, {"t": 2}, {"t": 3}]
+        app.cfg.mode = "manual"
+        app.plug_enabled.return_value = False
+        app.refresh_plan.side_effect = lambda **kw: None
+        app._plug_next = 0.0
+        app._notified_auth = False
+        state = {"water_temperature": 39, "is_online": True}
+        calls = {"n": 0}
+
+        def flaky_shadow(tokens):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise spa.SpaError("thing_shadow failed: Token is not authorized")
+            return state
+
+        stop = threading.Event()
+        with mock.patch.object(server.spa, "shadow", side_effect=flaky_shadow), \
+             mock.patch.object(server.notify, "configured", return_value=True), \
+             mock.patch.object(server.notify, "send_text",
+                               return_value=(True, "")) as send, \
+             mock.patch.object(server, "POLL_SECONDS", 0.02):
+            t = threading.Thread(target=server._poller_loop, args=(app, stop), daemon=True)
+            t.start()
+            time.sleep(0.15)
+            stop.set()
+            t.join(2)
+        self.assertFalse(t.is_alive())
+        app._invalidate_tokens.assert_called()
+        app._auto_relogin.assert_called()
+        send.assert_called_once()   # one-shot alert, not one per poll
+        self.assertGreaterEqual(app.update_state.call_count, 1)
+
+    def test_measured_cost_gated_until_history(self):
+        self.app.cfg.scheduler_cfg["PRICE_PER_KWH"] = 0.2263
+        self.app._plan = {"energy_alwayson_kwh": 100.0, "plan_ts": [0] * (24 * 7)}
+        # no history -> not enough
+        self.app._plug_hist = []
+        p = self.app._measured_cost_payload()
+        self.assertIs(p["enough"], False)
+        # a couple of hours is still too little for a 7-day figure
+        now = int(time.time())
+        self.app._plug_hist = [
+            {"ts": now - 3600 * 3, "watts": 60.0, "on": True, "fault": 0},
+            {"ts": now, "watts": 60.0, "on": True, "fault": 0},
+        ]
+        p2 = self.app._measured_cost_payload()
+        self.assertIs(p2["enough"], False)
+        # a full day of metered draw -> measured monthly + measured saving
+        self.app._plug_hist = []
+        start = now - 86400 - 300
+        for ts in range(start, now, 300):
+            self.app._plug_hist.append(
+                {"ts": ts, "watts": 60.0, "on": True, "fault": 0})
+        p3 = self.app._measured_cost_payload()
+        self.assertTrue(p3["enough"])
+        self.assertGreater(p3["coverage_h"], 20.0)
+        self.assertIn("monthly_cost", p3)
+        self.assertIn("saving_monthly", p3)
+        self.assertIn("saving_pct", p3)
+        self.assertGreater(p3["saving_pct"], 0.0)   # 60 W draw ~= 90% vs always-on
+
+    def test_measured_cost_hidden_without_price(self):
+        self.app.cfg.scheduler_cfg["PRICE_PER_KWH"] = 0.0
+        self.assertIs(self.app._measured_cost_payload()["enough"], False)
+
+    def test_auto_relogin_refreshes_tokens_and_notifies(self):
+        with mock.patch.object(server.spa, "get_tokens",
+                               return_value={"fresh": 1}) as gt, \
+             mock.patch.object(server.notify, "configured", return_value=True), \
+             mock.patch.object(server.notify, "send_text",
+                               return_value=(True, "")) as send:
+            ok = self.app._auto_relogin()
+        self.assertTrue(ok)
+        gt.assert_called_once_with(force=True)
+        self.assertEqual(self.app._tokens, {"fresh": 1})
+        send.assert_called_once()
+
+    def test_auto_relogin_throttled(self):
+        self.app._last_relogin = time.time()
+        with mock.patch.object(server.spa, "get_tokens") as gt:
+            self.assertFalse(self.app._auto_relogin())
+        gt.assert_not_called()
+
+    def test_auto_relogin_failure_is_harmless(self):
+        with mock.patch.object(server.spa, "get_tokens",
+                               side_effect=spa.SpaError("Login failed: nope")) as gt:
+            self.assertFalse(self.app._auto_relogin())
+        gt.assert_called_once_with(force=True)
+        self.assertIsNone(self.app._tokens)
+        msgs = [e["msg"] for e in self.app.get_log(50)]
+        self.assertTrue(any("Auto re-login failed" in m for m in msgs), msgs)
+
+    def test_auto_relogin_backs_off_when_no_binding(self):
+        # Login succeeds but Bestway returns no spa (tub offline on their side,
+        # e.g. wifi change): the server must log the real reason and extend its
+        # own cooldown so it stops rotating the account session mid-fix.
+        with mock.patch.object(server.spa, "get_tokens",
+                               side_effect=spa.SpaError(
+                                   "Login OK but no spa binding returned "
+                                   "(mxchip_device=None) — the spa looks offline "
+                                   "… wifi?")):
+            self.assertFalse(self.app._auto_relogin())
+        self.assertIsNone(self.app._tokens)
+        msgs = [e["msg"] for e in self.app.get_log(50)]
+        self.assertTrue(any("no spa bound" in m for m in msgs), msgs)
+        # next attempt is gated by the long backoff, not the short cooldown
+        self.assertGreater(server.REL_LOGIN_BACKOFF_S, server.REL_LOGIN_COOLDOWN_S)
+        with mock.patch.object(server.spa, "get_tokens") as gt:
+            with mock.patch.object(server.time, "time",
+                                   return_value=self.app._last_relogin
+                                   + server.REL_LOGIN_COOLDOWN_S - 1):
+                self.assertFalse(self.app._auto_relogin())
+            gt.assert_not_called()
+
     def test_tg_command_unknown_returns_none(self):
         self.assertIsNone(self.app._tg_command("/bogus"))
 
@@ -375,7 +729,7 @@ class TestSchedulerConfigUpdate(unittest.TestCase):
         cfg = mock.MagicMock()
         cfg.mode = "manual"
         cfg.scheduler_cfg = _scheduler_cfg()
-        self.app = server.SpaServer(cfg)
+        self.app = _spa_app(cfg)
         self.app.refresh_plan = mock.MagicMock(return_value={"changed": False})
 
     def _env(self):
@@ -398,7 +752,7 @@ class TestSchedulerConfigUpdate(unittest.TestCase):
         self.assertEqual(env["WINDOW"], "14:00-23:30")
         self.assertEqual(env["WINDOW_SAT"], "10:00-23:00")
         self.assertNotIn("WINDOW_SUN", env)
-        self.app.refresh_plan.assert_called_once_with(apply=False)
+        self.app.refresh_plan.assert_called_once_with(apply=False, force_weather=True)
 
     def test_accepts_overnight_window(self):
         out = self.app.update_scheduler_config({"window": "23:00-17:00"})
@@ -485,6 +839,21 @@ class TestSchedulerConfigUpdate(unittest.TestCase):
         self.assertAlmostEqual(c["cost_monthly"], 0.2263 * 4.0 * 30 / 7, places=6)
         self.assertAlmostEqual(c["saving_monthly"], 0.2263 * 6.0 * 30 / 7, places=6)
 
+    def test_cost_overview_stale_flag(self):
+        cfg = _scheduler_cfg()
+        cfg["PRICE_PER_KWH"] = 0.2263
+        plan = {"energy_kwh": 4.0, "energy_alwayson_kwh": 10.0,
+                "plan_ts": [0] * (24 * 7)}
+        fresh = server.cost_overview(cfg, plan, stale=False)
+        stale = server.cost_overview(cfg, plan, stale=True)
+        self.assertIs(fresh["stale"], False)
+        self.assertIs(stale["stale"], True)
+        # no plan / uncomputable -> stale-by-default estimate shape
+        empty = server.cost_overview(cfg, None, stale=False)
+        self.assertIs(empty["stale"], True)
+        self.assertNotIn("cost_plan", empty)
+        self.assertNotIn("cost_monthly", empty)
+
     def test_update_config_accepts_price(self):
         out = self.app.update_scheduler_config({"price": 0.312})
         self.assertAlmostEqual(out["price_per_kwh"], 0.312)
@@ -545,11 +914,20 @@ class TestAPIEndpoints(unittest.TestCase):
                      "plan_amb": [8.0], "plan_us": [0]}
         app._plan_ts = time.time()
         app.get_state.return_value = (_shadow(), time.time())
+        app.tub_online.return_value = True
+        app.state_age_s.return_value = 0
+        app._plan_stale.return_value = False
+        app.plug_enabled.return_value = False
+        app._measured_cost_payload.return_value = {"enough": False, "coverage_h": 0.0}
         app.get_history.return_value = [{"ts": int(time.time()) - i * 3600,
                                          "water": 39 - i, "target": 40,
                                          "heater": 1 if i < 2 else 0,
                                          "power": 1, "ambient": 8.0}
                                         for i in range(3)]
+        app.get_plugs.return_value = ({}, 0.0)
+        app.plug_kwh_window.return_value = 0.0
+        app.get_plug_history.return_value = []
+        app._reg_offsets = {}
         app.send_command.side_effect = lambda dp, val: {"datapoint": dp, "value": val,
                                                         "confirmed": True, "response": {}}
         app.refresh_plan.return_value = app._plan

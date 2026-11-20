@@ -493,17 +493,49 @@ class TestSchedulerStep(unittest.TestCase):
         self.assertEqual(len(res["plan_water"]), n)
         self.assertEqual(len(res["plan_set"]), n)
         self.assertEqual(len(res["plan_phase"]), n)
+        self.assertEqual(len(res["plan_mode"]), n)
         self.assertIn("energy_alwayson_kwh", res)
         self.assertIsInstance(res["energy_alwayson_kwh"], float)
         self.assertTrue(all(-5 <= v <= 40.5 for v in res["plan_water"]))
         self.assertTrue(set(res["plan_set"]) <= {28, 40})
         self.assertTrue(set(res["plan_phase"]) <= {"window", "preheat", "eco"})
+        self.assertTrue(set(res["plan_mode"]) <= {"off", "preheat", "hold"})
         # window hours (17:00-23:00 Monday) are set to target
         for i, ts in enumerate(res["plan_ts"]):
             hm = dt.datetime.fromtimestamp(ts)
             if 17 <= hm.hour < 23:
                 self.assertEqual(res["plan_set"][i], 40, ts)
                 self.assertEqual(res["plan_phase"][i], "window")
+
+    def test_plan_mode_differentiates_preheat_and_hold(self):
+        cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28, FLOOR_TEMP=8)
+        # In-window with the water already at 40 = maintenance: heater keeps
+        # the thermostat company, so the mode is "hold", not "preheat".
+        state = {"water_temperature": 40, "power_state": 1,
+                 "temperature_setting": 40, "heater_state": 6, "filter_state": 2}
+        mock_spa = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"spa": mock_spa}), \
+             mock.patch.object(scheduler.time, "time", return_value=ts_at(18)), \
+             mock.patch.object(scheduler, "fetch_forecast",
+                               return_value=self._mock_weather()):
+            res = scheduler.scheduler_step(cfg, 51.5, -0.12, state=state, apply=False)
+        self.assertEqual(res["phase"], "window")
+        self.assertEqual(res["plan_mode"][0], "hold")
+        # Early morning from a cold-ish start (24 < eco 28): heat is needed
+        # to climb, so the first ON hours are marked "preheat".
+        state2 = {"water_temperature": 24, "power_state": 1,
+                  "temperature_setting": 28, "heater_state": 0, "filter_state": 2}
+        with mock.patch.dict(sys.modules, {"spa": mock_spa}), \
+             mock.patch.object(scheduler.time, "time", return_value=ts_at(6)), \
+             mock.patch.object(scheduler, "fetch_forecast",
+                               return_value=self._mock_weather()):
+            res2 = scheduler.scheduler_step(cfg, 51.5, -0.12, state=state2, apply=False)
+        self.assertIn("preheat", set(res2["plan_mode"]))
+        for m, u in zip(res2["plan_mode"], res2["plan_us"]):
+            if m in ("preheat", "hold"):
+                self.assertEqual(u, 1, (m, u))
+            else:
+                self.assertEqual(m, "off")
 
     def test_eco_sends_heater_off_when_water_above_eco(self):
         # AUTO ECO: water is clearly above the ECO setpoint -> schedule the
@@ -570,6 +602,63 @@ class TestSchedulerStep(unittest.TestCase):
              mock.patch.object(scheduler, "fetch_forecast",
                                return_value=self._mock_weather()):
             res = scheduler.scheduler_step(cfg, 51.5, -0.12, state=state, apply=True)
+        self.assertFalse(res["changed"])
+        mock_spa.send_command.assert_not_called()
+
+    def test_step_accepts_prefetched_weather(self):
+        # The web server re-evaluates the plan frequently; it passes a cached
+        # forecast so no fresh weather API call is needed per evaluation.
+        cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28, FLOOR_TEMP=8)
+        state = {"water_temperature": 40, "power_state": 1,
+                 "temperature_setting": 40, "heater_state": 0, "filter_state": 2,
+                 "is_online": True}
+        mock_spa = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"spa": mock_spa}), \
+             mock.patch.object(scheduler, "fetch_forecast",
+                               side_effect=AssertionError(
+                                   "weather should be supplied, not fetched")) as ff, \
+             mock.patch.object(scheduler.time, "time", return_value=ts_at(1)):
+            res = scheduler.scheduler_step(cfg, 51.5, -0.12, state=state,
+                                           apply=False, weather=self._mock_weather())
+        ff.assert_not_called()
+        self.assertIn("phase", res)
+        self.assertEqual(len(res["plan_ts"]), len(res["plan_us"]))
+
+    def test_step_does_not_force_heater_on_at_target_in_window(self):
+        # Water already at the window setpoint: the thermostat holds on its
+        # own, so the scheduler must NOT command heater_state every step
+        # (that was the "plan says heat, device says no" loop).
+        cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28, FLOOR_TEMP=8)
+        state = {"water_temperature": 40, "power_state": 1,
+                 "temperature_setting": 40, "heater_state": 0, "filter_state": 2}
+        mock_spa = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"spa": mock_spa}), \
+             mock.patch.object(scheduler.time, "time", return_value=ts_at(18)), \
+             mock.patch.object(scheduler, "fetch_forecast",
+                               return_value=self._mock_weather()):
+            res = scheduler.scheduler_step(cfg, 51.5, -0.12, state=state, apply=True)
+        self.assertEqual(res["phase"], "window")
+        calls = [c[0] for c in mock_spa.send_command.call_args_list]
+        calls = [(dp, v) for _, dp, v in calls]
+        self.assertNotIn(("heater_state", 1), calls)
+
+    def test_step_skips_apply_when_tub_offline(self):
+        # The tub reports offline: auto mode must NOT fire commands into a
+        # void. The plan is still computed, but marked tub_online=False and
+        # applied=False so the UI can say "offline" instead of pretending.
+        cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28, FLOOR_TEMP=8)
+        state = {"water_temperature": 35, "power_state": 1,
+                 "temperature_setting": 40, "heater_state": 4, "filter_state": 2,
+                 "is_online": False, "ConnectType": "offline"}
+        mock_spa = mock.MagicMock()
+        mock_spa.is_online = lambda st: False
+        with mock.patch.dict(sys.modules, {"spa": mock_spa}), \
+             mock.patch.object(scheduler.time, "time", return_value=ts_at(1)), \
+             mock.patch.object(scheduler, "fetch_forecast",
+                               return_value=self._mock_weather()):
+            res = scheduler.scheduler_step(cfg, 51.5, -0.12, state=state, apply=True)
+        self.assertFalse(res["tub_online"])
+        self.assertFalse(res["applied"])
         self.assertFalse(res["changed"])
         mock_spa.send_command.assert_not_called()
 

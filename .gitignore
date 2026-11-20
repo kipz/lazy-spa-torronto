@@ -18,5 +18,11 @@ web.env
 # web server: durable operation log
 operation_log.jsonl
 
+# smart plug: durable power-sample log (measured kWh survives restarts)
+plug_log.jsonl
+
+# smart plug: QR-login session (contains cloud tokens — never publish)
+tuya.session.json
+
 # telegram notifications
 telegram.env

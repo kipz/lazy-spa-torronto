@@ -153,6 +153,24 @@ body {
 .chart-head h2 { margin: 0; font-size: 16px; }
 #chart { width: 100%; height: 300px; display: block; border-radius: 12px; }
 #heaterChart { width: 100%; height: 280px; display: block; border-radius: 12px; margin-top: 4px; }
+
+/* Smart plugs / energy card */
+#plugCard .hint { color: var(--muted); font-size: 12px; margin-top: 10px; line-height: 1.5; }
+#plugCard canvas { width: 100%; height: 140px; display: block; border-radius: 12px; margin-top: 8px; }
+.plug-list { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 10px; }
+.plug-row { display: flex; align-items: center; gap: 12px; font-family: var(--mono); padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,0.03); }
+.pr-badge { font-weight: 800; font-size: 11px; letter-spacing: 1px; padding: 3px 8px; border-radius: 6px; }
+.pr-badge.on { color: #0b2e1a; background: #7CFC8E; }
+.pr-badge.off { color: #ffe; background: rgba(255,255,255,0.14); }
+.pr-name { flex: 1; color: #e6ecff; }
+.pr-watts { font-weight: 800; color: var(--gold, #ffbe5c); min-width: 74px; text-align: right; }
+.pr-va { color: var(--muted); font-size: 12px; }
+.pr-online { font-size: 11px; }
+.pr-online.ok { color: #7CFC8E; }
+.pr-online.bad { color: #ff7b7b; }
+.plug-empty { color: var(--muted); font-size: 13px; padding: 8px 4px; }
+.plug-energy { display: flex; gap: 26px; font-family: var(--mono); margin-bottom: 2px; }
+.plug-energy b { color: var(--gold, #ffbe5c); font-weight: 800; }
 .range-pills { display: flex; gap: 6px; }
 .pill-btn {
   border: 1px solid var(--glass-border); background: rgba(255,255,255,0.05); color: var(--muted);
@@ -167,12 +185,16 @@ body {
 .sw.target { background: rgba(124,92,255,0.9); }
 .sw.on { background: var(--hot); }
 .sw.off { background: var(--off); }
+.sw.heat { background: #d96a3a; }
+.sw.hold { background: #2a7fd0; }
 #fcChart { width: 100%; height: 280px; display: block; border-radius: 12px; margin-top: 4px; }
 #fcChart + .legend { margin-top: 10px; }
 #forecastCard .hint { color: var(--muted); font-size: 12px; margin-top: 10px; line-height: 1.5; }
 .sw.fc-amb { background: #ffb86b; height: 3px; border-radius: 0; }
 .sw.fc-feels { background: repeating-linear-gradient(90deg, #f78fb3 0 3px, transparent 3px 6px); height: 3px; border-radius: 0; }
 .sw.fc-water { background: #4fd1ff; height: 3px; border-radius: 0; }
+.sw.fc-heat { background: rgba(255,159,67,0.75); }
+.sw.fc-hold { background: rgba(79,209,255,0.75); }
 .sw.fc-heater { background: rgba(255,107,107,0.55); }
 .sw.fc-window { background: rgba(124,92,255,0.55); }
 .sw.fc-preheat { background: rgba(255,209,102,0.55); }
@@ -275,6 +297,7 @@ input[type=range]::-moz-range-thumb {
 .auto-row code { font-family: var(--mono); }
 .auto-row .m-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .auto-row .m-row code { color: var(--text); }
+.auto-row .m-row code.stale { color: var(--warm, #ffb86b); }
 .auto-row .loc-link {
   font-family: var(--mono); color: var(--accent); text-decoration: none;
   border-bottom: 1px dotted rgba(124, 92, 255, 0.5);
@@ -306,6 +329,8 @@ input[type=range]::-moz-range-thumb {
 .plan-strip .blk:last-child { margin-right: 0; }
 .plan-strip .blk.on { background: linear-gradient(180deg, var(--hot), #b84545); }
 .plan-strip .blk.off { background: rgba(255,255,255,0.08); }
+.plan-strip .blk.preheat { background: linear-gradient(180deg, #ffb86b, #d96a3a); }
+.plan-strip .blk.hold { background: linear-gradient(180deg, #4fd1ff, #2a7fd0); }
 .plan-strip .blk.now { box-shadow: inset 0 0 0 2px #fff; }
 .plan-strip .now-marker {
   position: absolute; top: -6px; bottom: -6px; width: 2px;

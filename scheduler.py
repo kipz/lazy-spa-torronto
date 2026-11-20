@@ -626,7 +626,8 @@ def desired_heater_command(cfg, phase, setting, water):
     1 (heater on) or 0 (heater off). In AUTO mode the controller primarily
     drives temperature_setting and only touches heater_state when it must:
 
-      * window/preheat: ensure heat is on so the tub reaches and holds target;
+      * window/preheat: ensure heat is on so the tub reaches and holds target
+        (unless the water is already at/above the setpoint — see body);
       * eco with the water clearly above the ECO setting: command the heater
         OFF so the tub genuinely coasts down (which lets the server's UA
         sampler measure heat loss - the tub never cools otherwise);
@@ -634,6 +635,12 @@ def desired_heater_command(cfg, phase, setting, water):
         or below FLOOR_TEMP.
     """
     if phase != "eco":
+        # window/preheat: ensure heat is on so the tub reaches and holds
+        # target — but if the water is ALREADY at/above the setpoint the
+        # thermostat holds on its own, so leave heater_state alone (forcing
+        # it on just loops "plan says heat, device says no" every step).
+        if isinstance(water, (int, float)) and float(water) >= float(setting) - 0.5:
+            return None
         return 1
     if not isinstance(water, (int, float)):
         return None          # unknown water temp: let the thermostat govern
@@ -663,20 +670,26 @@ def phase_series(series, us, windows):
     return phases
 
 
-def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True):
-    """Run one hourly scheduler step: fetch weather -> replan -> (optionally) apply.
+def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True, weather=None):
+    """Run one scheduler step: fetch weather -> replan -> (optionally) apply.
 
     Returns a dict: {phase, setting, water_temp, ambient_now, plan_ts, plan_us,
     plan_amb, energy_kwh, changed}. This is the shared unit used by both the
     CLI `run` loop and the web server's scheduler thread.
+
+    ``weather`` may be a pre-fetched forecast dict (from fetch_forecast) so a
+    caller that re-evaluates frequently against fresh state (the web server)
+    can avoid re-hitting the weather API every time.
     """
     import spa  # reuses auth/command machinery
     horizon_days = max(3, (int(cfg["HORIZON_H"]) + 23) // 24)
-    weather = fetch_forecast(lat, lon, forecast_days=horizon_days)
+    if weather is None:
+        weather = fetch_forecast(lat, lon, forecast_days=horizon_days)
     t0 = time.time()
     series = forecast_series(cfg, weather, t0)
     if state is None:
         state = spa.shadow(tokens if tokens is not None else spa.get_tokens())
+    tub_online = spa.is_online(state) if state else False
     T0 = state.get("water_temperature")
     if not isinstance(T0, (int, float)):
         T0 = cfg["ECO_TEMP"]
@@ -689,40 +702,67 @@ def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True):
     phases = phase_series(series, us, windows)
     target = float(cfg["TARGET_TEMP"]) + float(cfg["MARGIN"])
     eco = float(cfg["ECO_TEMP"])
+    plan_set = [target if p != "eco" else eco for p in phases]
+    # Per-hour heater *mode* for the plan rendering:
+    #   "preheat" / "heat" — heater on and water still below the hour's
+    #       setpoint (actively raising temperature);
+    #   "hold"             — heater on at/above the setpoint (maintaining
+    #       target during the window / holding at the eco floor);
+    #   "off"              — heater idle.
+    plan_mode = []
+    for i in range(len(us)):
+        if not us[i]:
+            plan_mode.append("off")
+        else:
+            sp = plan_set[i]
+            end_t = temps[i + 1]
+            plan_mode.append("hold" if end_t >= sp - 0.5 else "preheat")
     changed = False
+    applied = False
     if apply:
-        if int(state.get("power_state") or 0) != 1:
-            spa.send_command(tokens, "power_state", 1)
-            changed = True
-        if int(state.get("temperature_setting") or 0) != setting:
-            spa.send_command(tokens, "temperature_setting", setting)
-            changed = True
-        # Heat command: keep heat on during window/preheat, and in ECO force
-        # the heater off (only when water is clearly above the ECO setpoint,
-        # never at/below FLOOR_TEMP) so the tub genuinely coasts down and the
-        # UA sampler can measure cooling rate. Only sends on a state change.
-        heat_cmd = desired_heater_command(cfg, phase, setting, T0)
-        cur_heat = int(state.get("heater_state") or 0)
-        if heat_cmd is not None:
-            cur_on = cur_heat != 0
-            want_on = heat_cmd != 0
-            if cur_on != want_on:
-                spa.send_command(tokens, "heater_state", 1 if want_on else 0)
+        if not tub_online:
+            # The tub is offline (or the shadow is stale/erroring): never fire
+            # commands into a void. Keep the plan fresh, but report that it
+            # was not applied so callers/UI can say "tub offline" instead of
+            # pretending the setpoint moved.
+            pass
+        else:
+            if int(state.get("power_state") or 0) != 1:
+                spa.send_command(tokens, "power_state", 1)
                 changed = True
-        if int(state.get("filter_state") or 0) == 0:
-            spa.send_command(tokens, "filter_state", 1)
-            changed = True
+            if int(state.get("temperature_setting") or 0) != setting:
+                spa.send_command(tokens, "temperature_setting", setting)
+                changed = True
+            # Heat command: keep heat on during window/preheat, and in ECO force
+            # the heater off (only when water is clearly above the ECO setpoint,
+            # never at/below FLOOR_TEMP) so the tub genuinely coasts down and the
+            # UA sampler can measure cooling rate. Only sends on a state change.
+            heat_cmd = desired_heater_command(cfg, phase, setting, T0)
+            cur_heat = int(state.get("heater_state") or 0)
+            if heat_cmd is not None:
+                cur_on = cur_heat != 0
+                want_on = heat_cmd != 0
+                if cur_on != want_on:
+                    spa.send_command(tokens, "heater_state", 1 if want_on else 0)
+                    changed = True
+            if int(state.get("filter_state") or 0) == 0:
+                spa.send_command(tokens, "filter_state", 1)
+                changed = True
+            applied = True
     return {
         "phase": phase,
         "setting": setting,
         "water_temp": T0,
         "ambient_now": series[0][1],
+        "tub_online": tub_online,
+        "applied": applied,
         "plan_ts": [s[0] for s in series],
         "plan_amb": [s[1] for s in series],
         "plan_us": us,
         "plan_water": [round(t, 2) for t in temps[:-1]],
-        "plan_set": [target if p != "eco" else eco for p in phases],
+        "plan_set": plan_set,
         "plan_phase": phases,
+        "plan_mode": plan_mode,
         "energy_kwh": energy,
         "energy_alwayson_kwh": round(always_on_energy(cfg, series), 2),
         "changed": changed,

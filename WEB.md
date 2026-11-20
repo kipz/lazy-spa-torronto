@@ -17,13 +17,14 @@ Open `http://<host>:8080/` in a browser.
 | Area | What you can do |
 |---|---|
 | **Gauge** | Current water temp, target badge, pulsing heater indicator |
-| **Chart** | Water temp vs ambient vs target over 6h/24h/3d/7d; hover tooltip; heater-on bands |
+| **Charts** | Heater &amp; pump chart (water temp, heater-ON bands, derived heater kW) and a real-draw smart-plug power chart |
 | **Controls** | Power, heat, filter, bubbles, jet, lock toggles; 20–40 °C target slider |
 | **Auto-heating** | Manual ⇄ Auto mode switch, live phase (eco/preheat/window), 24 h heater-on plan strip, replan button, config summary incl. location and learned model |
 | **Settings** | Edit the default/per-day use windows, target/eco/floor temperatures, margin, and location (type-ahead + validation) from the UI |
 | **Feedback** | Command progress modal (sent → confirmed by status), AUTO lock hints, and a live operation log |
 | **Forecast** | Multi-day (3d/7d) ambient forecast cards + a plan chart overlaying projected water temperature, heater-on blocks and window/preheat shading on the weather timeline |
 | **Weather** | Next-24 h forecast fact + ambient in chart/facts |
+| **Smart plug** | Relay on/off + live power (W) for the mains and lights plugs, today's kWh + £ cost from the mains meter, with a watts sparkline; Telegram alerts on relay toggles |
 
 ## Modes
 
@@ -51,8 +52,9 @@ Switching to Auto while mid-preheat asks for confirmation.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/state` | Live shadow + mode + phase + setting |
-| GET | `/api/history?range=24` | Water/target/heater/ambient series (hours) |
+| GET | `/api/state` | Live shadow + mode + phase + setting + per-plug readings (`plugs`), `plug_kwh_today`/`plug_kwh_7d`, and `register_offsets` (rolling B1/B2/B9 probe offsets vs the control probe, for sensor calibration) |
+| GET | `/api/history?range=24` | `series` (legacy) + `plug` power samples |
+| GET | `/api/plug` | Latest plug readings (relay state, watts, V, A, online per device), `kwh_today` (local-midnight) and measured `kwh_24h` / `kwh_7d` |
 | GET | `/api/plan` | 48 h optimal-start heater plan + energy + projected water/setpoint/phase per hour |
 | GET | `/api/scheduler` | Mode, windows, per-day overrides, target/eco/floor/margin, location + lat/lon, measured model (`ua`, `p`, samples, source) |
 | POST | `/api/scheduler` | `{"mode":"auto"\|"manual"}`, `{"replan":true}`, or `{"config":{...}}` |
@@ -61,7 +63,7 @@ Switching to Auto while mid-preheat asks for confirmation.
 | POST | `/api/cmd` | `{"datapoint","value"}` — clamped 20–40, temp rejected in auto |
 | GET | `/api/health` | Connectivity, last update age |
 | GET | `/api/log?limit=100` | Recent server-side operations (persistent, up to 3000 entries) |
-| GET | `/api/events` | SSE live push (state/plan/mode/config/log) |
+| GET | `/api/events` | SSE live push (state/plan/mode/config/log/plug) |
 
 A config update looks like:
 
@@ -94,13 +96,28 @@ The `/api/scheduler` payload carries the full current state, including the
 the number of `ua_samples`, the `source` (`default`, `calibrated`, or
 `online coast-down`) and when it was last saved.
 
-**Energy cost.** The plan carries `energy_kwh` (the optimal-start consumption
-over the horizon) and `energy_alwayson_kwh` (the baseline `kWh` to hold the
-tub at target 24/7). The `/api/scheduler` payload adds a `cost` object —
-`cost_plan`, `cost_alwayson`, `saving_cost` and `saving_pct` — priced with the
-configurable `PRICE_PER_KWH` (editable as `price` in the settings UI / config
-save, stored in `scheduler.env`). The dashboard shows the estimated spend and
-how much is saved vs leaving the heater on all the time.
+**Energy cost.** Cost is always **measured real draw** — the dashboard's energy
+and cost figures ("energy today" and "energy (7d)") come from integrating the
+smart plug's live wattage (`plug_kwh_today`, `plug_kwh_7d`), priced with the
+configurable `PRICE_PER_KWH` (`price` in the settings UI / config save, stored
+in `scheduler.env`). The scheduler's planned `energy_kwh`/`cost` remain
+available as an estimate of the *optimal-start* heating plan, but they are no
+longer shown as "the cost" — the running spend reflects what the tub actually
+draws.
+
+**Smart plugs / energy.** The tub is fed by Tuya / Smart Life smart plugs
+("Tub mains" and "Tub lights"). Because they sit behind the garden router's
+NAT they aren't reachable on the LAN, so `server.py` reads them over the
+**Tuya cloud** using the account-level device-sharing SDK (the same flow Home
+Assistant's Tuya integration uses), authorised once via a QR code scanned in
+the Smart Life app (session persisted to `tuya.session.json`, gitignored).
+The poller queries them every `PLUG_POLL` seconds (default 30) and surfaces
+each plug's relay state, `cur_power`/`cur_voltage`/`cur_current`/`fault`, and
+online status; the mains plug's wattage is integrated into a kWh counter reset
+at local midnight. When a plug's relay toggles on/off, a Telegram message is
+sent (via the existing `telegram.env` bot). Plugs are strictly read-only —
+there is deliberately no way to switch them from the UI. See `plug.py` for the
+one-time setup.
 
 The plan payload carries a per-hour **schedule projection** used by the
 forecast chart: `plan_water` (projected water temperature), `plan_set`
@@ -126,11 +143,13 @@ Command datapoints: `power_state`, `heater_state`, `filter_state`,
 `server.py` (stdlib `ThreadingHTTPServer`) runs three background threads:
 
 1. **Poller** — fetches the shadow every 15 s, keeps 7 days in memory, persists
-   a snapshot to `shadow_log.jsonl` every 5 minutes, and refreshes the heating
-   plan (apply only in Auto mode).
+   a snapshot to `shadow_log.jsonl` every 5 minutes, refreshes the heating
+   plan (apply only in Auto mode), and polls the smart plug's power over the
+   Tuya cloud every `PLUG_POLL` seconds.
 2. **Scheduler thread** — reuses `scheduler.scheduler_step()` from
    `scheduler.py` (weather → optimal-start plan → temperature_setting).
-3. **SSE** — pushes state/plan/mode events to the browser so the UI is live.
+3. **SSE** — pushes state/plan/mode/config/log/plug events to the browser so
+   the UI is live.
 
 The poller also measures the tub's real cooling rate (`UA`) from overnight
 coast-downs: it pairs shadow readings ~2 h apart while the water is well above
@@ -148,6 +167,12 @@ step). The chart is a custom `<canvas>` renderer with `requestAnimationFrame`.
 BIND=0.0.0.0      # bind address
 PORT=8080         # port
 MODE=manual       # initial mode (auto | manual)
+
+# smart plug (Tuya cloud): see plug.py for the one-time QR login
+# TUYA_DEVICE_ID=bf44bba069707d19bf5ysd
+# TUYA_DEVICE_NAME=Tub mains
+# TUYA_SESSION=/path/to/tuya.session.json
+# PLUG_POLL=30     # plug poll cadence (seconds)
 ```
 
 Scheduler parameters (windows, target/eco/floor, margin) come from

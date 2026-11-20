@@ -27,6 +27,10 @@ const state = {
   range: 24,
   fcDays: 3,
   registerHistory: [],
+  plugs: {},
+  plugKwhToday: 0,
+  plugKwh7d: 0,
+  plugSeries: [],
   tempLocked: false,
 };
 
@@ -433,7 +437,8 @@ function renderDayCards() {
     const sched = dayPlanStats(dd.ts);
     const schedHtml = sched
       ? '<span class="day-sched" title="projected from today\'s weather + measured UA">'
-        + "🕘 preheat " + sched.firstHeat + ":00 · 🔌 " + sched.onH + "h ON · min "
+        + "🕘 preheat " + sched.firstHeat + ":00 · 🔥 " + sched.preH + "h heat · "
+        + (sched.holdH ? "🎯 " + sched.holdH + "h at target · " : "") + "min "
         + sched.minW.toFixed(1) + "°</span>"
       : "";
     card.innerHTML =
@@ -453,19 +458,21 @@ function dayPlanStats(dayTs) {
   d0.setHours(0, 0, 0, 0);
   const start = d0.getTime() / 1000;
   const end = start + 86400;
-  let firstHeat = null, onH = 0, minW = Infinity;
+  const modes = plan.plan_mode || [];
+  let firstHeat = null, onH = 0, preH = 0, holdH = 0, minW = Infinity;
   for (let i = 0; i < plan.plan_ts.length; i++) {
     const t = plan.plan_ts[i];
     if (t < start || t >= end) continue;
     if (plan.plan_us[i]) {
       onH++;
       if (firstHeat == null) firstHeat = new Date(t * 1000).getHours();
+      if (modes[i] === "hold") holdH++; else preH++;
     }
     if (plan.plan_water && plan.plan_water[i] != null)
       minW = Math.min(minW, plan.plan_water[i]);
   }
   if (firstHeat == null) return null;
-  return { firstHeat, onH, minW };
+  return { firstHeat, onH, preH, holdH, minW };
 }
 
 function drawForecastChart() {
@@ -562,12 +569,16 @@ function drawForecastChart() {
     ctx.fillText("0°", pad.l + 4, Y(0) - 3);
   }
 
-  // heater-on bands (clearly visible, drawn on top of the shading)
+  // heater-on bands (clearly visible, drawn on top of the shading).
+  // preheat = raising toward target (amber); hold = maintaining target (blue).
   if ((plan.plan_us || []).length) {
-    ctx.fillStyle = "rgba(255,107,107,0.30)";
+    const mode = plan.plan_mode || [];
     plan.plan_us.forEach((u, i) => {
       if (!u) return;
       const x0 = X(plan_ts[i]), x1 = X(plan_ts[i] + 3600);
+      ctx.fillStyle = mode[i] === "hold"
+        ? "rgba(79,209,255,0.30)"
+        : "rgba(255,159,67,0.34)";
       ctx.fillRect(x0, pad.t, Math.max(1, x1 - x0), ih);
     });
   }
@@ -686,6 +697,7 @@ function renderHeat(shadow) {
   const status = heaterLabel(shadow, state.heater);
   const badge = $("#heaterBadge");
   const label = {
+    offline: ["⚠️ offline", "heater-off"],
     heating: ["🔥 heating", "heater-on"],
     cooling: ["❄ cooling", "heater-cool"],
     holding: ["🔥 holding", "heater-hold"],
@@ -708,18 +720,19 @@ function renderAutoDevices() {
   const auto = state.mode === "auto";
   const on = (v) => !!(v && v !== "0");
   const heatText = state.heater || heaterLabel(s, null);
+  const offline = state.tubOnline === false;
   const filterDetail = s.filter_state === 2 ? "running" : on(s.filter_state) ? "on" : "off";
   const chips = [
-    { icon: "⚡", label: "power", v: on(s.power_state) ? "on" : "off", owner: auto ? "auto" : "manual" },
-    { icon: "🌀", label: "filter pump", v: filterDetail, owner: auto ? "auto" : "manual" },
-    { icon: "🔥", label: "heater", v: heatText, owner: auto ? "auto" : "manual" },
-    { icon: "🫧", label: "bubbles", v: on(s.wave_state) ? "on" : "off", owner: "manual" },
-    { icon: "💦", label: "jet", v: on(s.hydrojet_state) ? "on" : "off", owner: "manual" },
+    { icon: "⚡", label: "power", v: offline ? "offline" : on(s.power_state) ? "on" : "off", owner: auto ? "auto" : "manual" },
+    { icon: "🌀", label: "filter pump", v: offline ? "offline" : filterDetail, owner: auto ? "auto" : "manual" },
+    { icon: "🔥", label: "heater", v: offline ? "offline" : heatText, owner: auto ? "auto" : "manual" },
+    { icon: "🫧", label: "bubbles", v: offline ? "offline" : on(s.wave_state) ? "on" : "off", owner: "manual" },
+    { icon: "💦", label: "jet", v: offline ? "offline" : on(s.hydrojet_state) ? "on" : "off", owner: "manual" },
   ];
   host.innerHTML = "";
   for (const c of chips) {
     const span = document.createElement("span");
-    const isOn = c.v !== "off" && c.v !== "idle";
+    const isOn = c.v !== "off" && c.v !== "idle" && c.v !== "offline";
     span.className = "dev " + (isOn ? "on" : "off");
     span.title = c.label + ": " + c.v + (c.owner === "auto" ? " (scheduler-controlled in AUTO)" : " (manual)");
     span.innerHTML = "<i>" + c.icon + "</i> " + c.label + " <b>" + c.v + "</b>"
@@ -756,14 +769,15 @@ function syncMode() {
 function refreshFacts() {
   if (state.plan) {
     $("#factAmb").textContent = (state.plan.ambient_now != null ? state.plan.ambient_now.toFixed(1) : "—") + "°";
-    if (state.plan && state.plan.energy_kwh != null) {
-      let txt = state.plan.energy_kwh.toFixed(1) + " kWh";
-      const cost = state.config && state.config.cost;
-      if (cost && cost.cost_plan != null) txt += " · £" + cost.cost_plan.toFixed(2);
-      $("#factEnergy").textContent = txt;
-    } else {
-      $("#factEnergy").textContent = "—";
-    }
+  }
+  // "energy today" comes from the smart plug's real measured draw, not the plan.
+  if (state.plugKwhToday != null && isFinite(state.plugKwhToday)) {
+    let txt = state.plugKwhToday.toFixed(2) + " kWh";
+    const price = state.config && state.config.price_per_kwh;
+    if (price) txt += " · £" + (price * state.plugKwhToday).toFixed(2);
+    $("#factEnergy").textContent = txt;
+  } else {
+    $("#factEnergy").textContent = "—";
   }
   const cur = state.current;
   if (cur && cur.temp != null) {
@@ -879,16 +893,20 @@ function renderPlanStrip() {
   const now = Date.now() / 1000;
   const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   const first = state.plan.plan_ts[0];
+  const modes = state.plan.plan_mode || [];
   for (let i = 0; i < n; i++) {
     const ts = state.plan.plan_ts[i];
     const d = new Date(ts * 1000);
     const hh = d.getHours();
-    // heater block
+    const m = modes[i] || (state.plan.plan_us[i] ? "preheat" : "off");
+    // heater block: off | preheat (raising) | hold (at target)
     const b = document.createElement("div");
-    b.className = "blk " + (state.plan.plan_us[i] ? "on" : "off");
+    b.className = "blk " + m + (state.plan.plan_us[i] ? "" : " off");
     if (ts <= now && now < ts + 3600) b.classList.add("now");
+    const verb = m === "hold" ? "heater ON · at target"
+      : m === "preheat" ? "heater ON · preheating" : "heater off";
     b.title = (String(hh).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"))
-      + (state.plan.plan_us[i] ? " heater ON" : " heater off")
+      + " " + verb
       + (state.plan.plan_amb && state.plan.plan_amb[i] != null
          ? " · " + state.plan.plan_amb[i].toFixed(0) + "°C" : "");
     strip.appendChild(b);
@@ -924,7 +942,7 @@ function renderConfig() {
   $("#cfgTemps").textContent = (d.target != null ? d.target : "—") + " / "
     + (d.eco != null ? d.eco : "—") + " / " + (d.floor != null ? d.floor : "—");
   $("#cfgMargin").textContent = (d.margin != null ? d.margin : "—") + "°";
-  renderCost(d.cost, d.price_per_kwh);
+  renderCost(d.price_per_kwh);
   const ov = d.overrides || {};
   const active = DAYS.filter((day) => ov[day]).map((day) => day + " " + ov[day]);
   $("#cfgOverrides").textContent = active.length ? active.join(", ") : "none";
@@ -950,29 +968,72 @@ function renderConfig() {
   }
 }
 
-function renderCost(cost, price) {
+function renderCost(price) {
   const kb = $("#cfgCost");
   const sb = $("#cfgSaving");
-  const fmtP = (v) => "£" + Number(v).toFixed(2);
-  if (!cost || cost.plan_kwh == null) {
-    kb.textContent = (price != null ? "Σ" : "—");
-    sb.textContent = "—";
-    return;
+  const p = price != null && price > 0;
+  const today = state.plugKwhToday != null && isFinite(state.plugKwhToday);
+  const d7 = state.plugKwh7d != null && isFinite(state.plugKwh7d);
+  // Measured basis figures: only trusted after a day of continuous metering;
+  // before that the 7-day window is dominated by a restart/outage.
+  const mc = (state.config && state.config.measured_cost) || {};
+  const enough = mc.enough === true;
+  const planC = (state.config && state.config.cost) || {};
+  kb.textContent = today
+    ? state.plugKwhToday.toFixed(2) + " kWh" + (p ? " · £" + (price * state.plugKwhToday).toFixed(2) : "")
+    : "—";
+  if (sb) {
+    if (d7) {
+      let txt = state.plugKwh7d.toFixed(1) + " kWh" + (p ? " · £" + (price * state.plugKwh7d).toFixed(2) : "");
+      if (!enough) txt += " · measuring…";
+      sb.textContent = txt;
+    } else {
+      sb.textContent = "—";
+    }
   }
-  kb.textContent = cost.plan_kwh.toFixed(1) + " kWh · " + fmtP(cost.cost_plan)
-    + (cost.cost_monthly != null ? " · ≈" + fmtP(cost.cost_monthly) + "/mo" : "")
-    + (price != null ? " @" + Number(price).toFixed(3) + "/kWh" : "");
-  if (cost.saving_cost != null)
-    sb.textContent = fmtP(cost.saving_cost) + " (" + cost.saving_pct.toFixed(0) + "%)"
-      + (cost.saving_monthly != null ? " · ≈" + fmtP(cost.saving_monthly) + "/mo" : "");
-  else
-    sb.textContent = "—";
+  const mo = $("#cfgMonthly");
+  const sv = $("#cfgSaving30");
+  if (mo) {
+    const mCheck = mc.monthly_cost != null && mc.monthly_cost > 0;
+    if (p && enough && typeof mc.monthly_cost === "number" && mCheck) {
+      // Real spend, scaled to a month — same basis as the saving row below.
+      mo.textContent = "£" + mc.monthly_cost.toFixed(2)
+        + " · " + (mc.measured_kwh_7d != null ? mc.measured_kwh_7d.toFixed(1) : "0.0") + " kWh/7d measured";
+      mo.classList.remove("stale");
+    } else if (p && enough && typeof mc.monthly_cost === "number") {
+      // Metered but genuinely ~0 (tub idle/off this week).
+      mo.textContent = "£0.00 · " + (mc.measured_kwh_7d != null ? mc.measured_kwh_7d.toFixed(2) : "0.00") + " kWh/7d measured";
+      mo.classList.remove("stale");
+    } else if (typeof planC.cost_monthly === "number" && !planC.stale) {
+      // No meaningful measured data yet: plan estimate, clearly labelled.
+      mo.textContent = "£" + planC.cost_monthly.toFixed(2) + " · plan est";
+      mo.classList.remove("stale");
+    } else if (typeof planC.cost_monthly === "number") {
+      mo.textContent = "£" + planC.cost_monthly.toFixed(2) + " · plan est ⚠";
+      mo.classList.add("stale");
+    } else {
+      mo.textContent = "—";
+    }
+  }
+  if (sv) {
+    if (enough && typeof mc.saving_monthly === "number") {
+      const pct = typeof mc.saving_pct === "number" ? mc.saving_pct.toFixed(0) + "%" : "";
+      sv.textContent = "£" + mc.saving_monthly.toFixed(2) + (pct ? " (" + pct + ")" : "");
+      sv.classList.remove("stale");
+    } else if (!enough) {
+      sv.textContent = "measuring…";
+      sv.classList.remove("stale");
+    } else {
+      sv.textContent = "—";
+    }
+  }
 }
 
 function refreshConfig() {
   return api("/api/scheduler").then((d) => {
     state.config = d;
     renderConfig();
+    renderPlug();
   }).catch(() => {});
 }
 
@@ -1200,16 +1261,132 @@ async function loadLog() {
 }
 
 /* ---------------- data loading ---------------- */
+// Renders a list of plug devices (name + on/off + watts + V/A) plus the
+// mains energy readout and status line.
+function renderPlug() {
+  const list = $("#plugList");
+  if (!list) return;
+  const st = $("#plugStatus");
+  const plugs = state.plugs || {};
+  const ids = Object.keys(plugs);
+  list.innerHTML = "";
+  if (!ids.length) {
+    list.innerHTML = "<p class='plug-empty'>plug not configured / offline</p>";
+    if (st) st.textContent = "plug not configured / offline";
+    $("#plugKwh").textContent = "—";
+    $("#plugCost").textContent = "—";
+    drawPlugChart();
+    return;
+  }
+  for (const id of ids) {
+    const p = plugs[id];
+    const on = !!p.switch_on;
+    const row = document.createElement("div");
+    row.className = "plug-row";
+    const w = p.watts >= 1000
+      ? (p.watts / 1000).toFixed(2) + " kW"
+      : Math.round(p.watts) + " W";
+    const va = (p.voltage_v != null ? p.voltage_v.toFixed(0) : "?") + " V"
+      + (p.current_a != null ? " · " + p.current_a.toFixed(2) + " A" : "");
+    row.innerHTML = "<span class='pr-badge " + (on ? "on" : "off") + "'>"
+      + (on ? "ON" : "OFF") + "</span>"
+      + "<span class='pr-name'>" + (p.device || id) + "</span>"
+      + "<span class='pr-watts'>" + w + "</span>"
+      + "<span class='pr-va'>" + va + "</span>"
+      + "<span class='pr-online " + (p.online ? "ok" : "bad") + "'>"
+      + (p.online ? "online" : "offline") + "</span>";
+    list.appendChild(row);
+  }
+  $("#plugKwh").textContent = state.plugKwhToday != null && isFinite(state.plugKwhToday)
+    ? state.plugKwhToday.toFixed(2) + " kWh" : "—";
+  const price = state.config && state.config.price_per_kwh;
+  $("#plugCost").textContent = (price && state.plugKwhToday != null && isFinite(state.plugKwhToday))
+    ? "£" + (price * state.plugKwhToday).toFixed(2) : "—";
+  let oldest = 0, anyOnline = false;
+  for (const id of ids) {
+    const a = Date.now() / 1000 - (plugs[id].ts || 0);
+    if (a > oldest) oldest = a;
+    if (plugs[id].online) anyOnline = true;
+  }
+  const ago = oldest < 300 ? "now"
+    : (oldest < 3600 ? Math.round(oldest / 60) + "m" : Math.round(oldest / 3600) + "h");
+  if (st) st.textContent = (anyOnline ? "online" : "offline") + " · " + ago;
+  drawPlugChart();
+}
+
+function drawPlugChart() {
+  const cv = $("#plugChart");
+  if (!cv) return;
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (!W || !H) return;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const ctx = cv.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+  const pad = { l: 8, r: 52, t: 8, b: 6 };
+  const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+  const series = (state.plugSeries || []).filter((q) => typeof q.watts === "number");
+  if (!series.length) {
+    ctx.fillStyle = "#8b97b5"; ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("collecting power…", W / 2, H / 2); return;
+  }
+  const t0 = series[0].ts, t1 = series[series.length - 1].ts;
+  const span = Math.max(1, t1 - t0);
+  const X = (ts) => pad.l + iw * (ts - t0) / span;
+  // Robust y-scale: a rare spike shouldn't squash the rest of the signal. Use
+  // the ~93rd percentile as the base and cap well above the median; the label
+  // still reports the true peak.
+  const sorted = series.map((q) => q.watts).sort((a, b) => a - b);
+  const n = sorted.length;
+  const pct = sorted[Math.min(n - 1, Math.floor(0.93 * (n - 1)))];
+  const mid = sorted[Math.floor(n / 2)];
+  const peak = sorted[n - 1];
+  const scaleMax = Math.max(
+    1.0,
+    (isFinite(pct) ? pct * 1.2 : 1.0),
+    (isFinite(mid) ? mid * 3 : 0),
+    (isFinite(peak) && peak > 0 ? peak * 0.1 : 1.0)
+  );
+  const Y = (w) => pad.t + ih * (1 - w / scaleMax);
+  // baseline
+  ctx.strokeStyle = "rgba(255,255,255,0.06)"; ctx.beginPath();
+  ctx.moveTo(pad.l, pad.t + ih); ctx.lineTo(pad.l + iw, pad.t + ih); ctx.stroke();
+  // area fill
+  ctx.fillStyle = "rgba(255,190,92,0.18)"; ctx.beginPath();
+  ctx.moveTo(X(t0), pad.t + ih);
+  series.forEach((q) => ctx.lineTo(X(q.ts), Y(q.watts)));
+  ctx.lineTo(X(t1), pad.t + ih); ctx.closePath(); ctx.fill();
+  // line
+  ctx.strokeStyle = "#ffbe5c"; ctx.lineWidth = 1.6; ctx.beginPath();
+  series.forEach((q, i) => { const x = X(q.ts), y = Y(q.watts); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.stroke();
+  // labels: true peak W/kW (right) + gridlines at half-scale
+  ctx.fillStyle = "#aab6d4"; ctx.font = "10px sans-serif"; ctx.textAlign = "right";
+  ctx.fillText((peak >= 1000 ? (peak / 1000).toFixed(1) + " kW" : Math.round(peak) + " W"),
+               W - pad.r, pad.t + 8);
+  ctx.fillStyle = "rgba(255,255,255,0.06)";
+  ctx.fillText((scaleMax / 2 >= 1000 ? (scaleMax / 2 / 1000).toFixed(1) + "k" : Math.round(scaleMax / 2) + ""),
+               W - pad.r, Y(scaleMax / 2));
+  ctx.fillText("0", W - pad.r, pad.t + ih);
+}
 async function loadState() {
   try {
     const d = await api("/api/state");
     state.mode = d.mode;
     state.shadow = d.state || {};
     state.heater = d.heater;
+    state.tubOnline = d.tub_online;
+    state.stateAge = d.state_age_s;
     if (d.ts) state.shadow._ts = d.ts;
     if (d.phase) state.phase = d.phase;
+    if (d.plugs != null) state.plugs = d.plugs;
+    if (d.plug_kwh_today != null) state.plugKwhToday = d.plug_kwh_today;
+    if (d.plug_kwh_7d != null) state.plugKwh7d = d.plug_kwh_7d;
+    renderPlug();
     syncMode();
     reflectShadow();
+    renderConn();
     if (!state.plan && d.phase) refreshFacts();
   } catch (e) {
     $("#conn").className = "pill offline";
@@ -1220,9 +1397,9 @@ async function loadState() {
 async function loadHistory() {
   try {
     const d = await api("/api/history?range=" + state.range);
-    state.history = d.series || [];
-    drawChart();
-  } catch (e) { /* chart stays empty */ }
+    state.plugSeries = d.plug || [];
+    drawPlugChart();
+  } catch (e) { /* sparkline stays empty */ }
 }
 
 async function loadPlan() {
@@ -1248,13 +1425,33 @@ async function loadWeather() {
 async function refreshAll() {
   await loadState();
   await Promise.all([loadHistory(), loadRegisterHistory(), loadPlan(), loadWeather(), refreshConfig(), loadLog()]);
-  const el = $("#conn");
-  if (state.shadow && Object.keys(state.shadow).length) {
-    const age = (Date.now() / 1000) - (state.shadow._ts || 0);
-    el.className = "pill online";
-    el.textContent = "online · " + (state.shadow.temperature_setting ? "target " + state.shadow.temperature_setting + "°" : "synced");
-  }
+  renderConn();
   if ($("#factPhase").textContent !== "—") $("#hero").classList.add("shimmer");
+}
+
+// Connectivity pill + offline handling. A tub is only "online" when the server
+// has a *fresh* shadow (stateAge small) that reports the device online; a
+// week-old snapshot must never render as "online · target 40°".
+function renderConn() {
+  const el = $("#conn");
+  if (!el) return;
+  const s = state.shadow;
+  const fresh = state.stateAge != null && state.stateAge < 300;
+  if (state.tubOnline === true) {
+    el.className = "pill online";
+    el.textContent = "online · " + (s && s.temperature_setting ? "target " + s.temperature_setting + "°" : "synced");
+    return;
+  }
+  if (s && Object.keys(s).length) {
+    const age = state.stateAge || Math.round((Date.now() / 1000) - (state.shadow._ts || 0));
+    const ago = age < 3600 ? Math.round(age / 60) + "m ago" : (age / 3600).toFixed(0) + "h ago";
+    const stale = age > 300;
+    el.className = "pill " + (fresh && age < 3600 ? "warn" : "offline");
+    el.textContent = "tub " + (fresh ? "offline" : stale ? "offline · data " + ago : "offline");
+  } else {
+    el.className = "pill offline";
+    el.textContent = "offline";
+  }
 }
 
 /* ---------------- actions ---------------- */
@@ -1318,13 +1515,39 @@ async function toggleMode(auto) {
   }
 }
 
+// One-line summary of the current heating plan, for replan confirmation.
+function planSummary() {
+  const p = state.plan;
+  if (!p || !p.plan_ts) return "no plan yet";
+  const ts = p.plan_ts || [], ph = p.plan_phase || [];
+  let nextW = "—";
+  for (let i = 0; i < ts.length; i++) {
+    if (ph[i] === "window") {
+      const d = new Date(ts[i] * 1000);
+      nextW = ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2);
+      break;
+    }
+  }
+  const modes = p.plan_mode || [];
+  const on24 = (p.plan_us || []).slice(0, 24).reduce((a, u) => a + (u ? 1 : 0), 0);
+  let heatH = 0, holdH = 0;
+  for (let i = 0; i < Math.min(24, modes.length); i++) {
+    if (modes[i] === "hold") holdH++;
+    else if (modes[i] === "preheat") heatH++;
+  }
+  const en = typeof p.energy_kwh === "number" ? p.energy_kwh.toFixed(1) + " kWh" : "?";
+  return "phase " + (p.phase || "?") + " · target " + (p.setting != null ? p.setting + "°" : "?")
+    + " · heater ON " + on24 + "h/24h (" + heatH + "h preheat · " + holdH + "h at target)"
+    + " · next window " + nextW + " · " + en;
+}
+
 function bindEvents() {
   $("#modeToggle").addEventListener("change", (e) => toggleMode(e.target.checked));
   $("#replanBtn").addEventListener("click", async () => {
     try {
       await api("/api/scheduler", { method: "POST", body: JSON.stringify({ replan: true }) });
-      toast("Plan recomputed");
-      loadPlan();
+      await loadPlan();
+      toast("Plan recomputed · " + planSummary(), "ok");
       loadLog();
     } catch (e) { toast(e.message, "err"); }
   });
@@ -1368,16 +1591,7 @@ function bindEvents() {
     }, 350);
   });
 
-  $("#rangePills").addEventListener("click", (e) => {
-    const btn = e.target.closest(".pill-btn");
-    if (!btn) return;
-    $$(".pill-btn").forEach((b) => b.classList.remove("active"));
-    btn.classList.add("active");
-    state.range = parseInt(btn.dataset.range, 10);
-    loadHistory();
-  });
-
-  window.addEventListener("resize", () => { drawChart(); drawHeaterChart(); renderForecast(); });
+  window.addEventListener("resize", () => { drawHeaterChart(); drawPlugChart(); renderForecast(); });
 }
 
 /* ---------------- SSE ---------------- */
@@ -1390,6 +1604,7 @@ function connectSSE() {
       else if (d.kind === "mode") refreshAll();
       else if (d.kind === "plan") { loadPlan(); refreshConfig(); }
       else if (d.kind === "config") { refreshConfig(); loadPlan(); }
+      else if (d.kind === "plug") { loadState(); loadHistory(); }
       else if (d.kind === "log") loadLog();
     } catch (e) { /* ignore */ }
   };

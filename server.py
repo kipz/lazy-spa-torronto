@@ -31,20 +31,56 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 POLL_SECONDS = 15.0
+PLUG_POLL_SECONDS = 15.0           # smart-plug (Tuya cloud) poll cadence
 HISTORY_SECONDS = 7 * 86400        # keep ~1 week of history in memory
+PLUG_HISTORY_SECONDS = 7 * 86400   # keep ~1 week of plug power samples
+PLUG_LOG_FILE = "plug_log.jsonl"   # durable plug power samples (gitignored)
+PLUG_LOG_MAX = 60000               # ~10 days at the 15 s poll cadence
 SHADOW_LOG_SECONDS = 300           # append one shadow snapshot to JSONL per 5 min
 LOG_MAX = 300                      # operation log entries kept in memory
 OPERATION_LOG_FILE = "operation_log.jsonl"   # durable operation log (gitignored)
 LOG_FILE_MAX = 3000                # prune the durable log to this many entries
-# Online cooling-rate (UA) estimate from real heater-off coast-downs. Spans
-# are long enough to rise above the spa's 1 C temperature resolution.
-UA_MIN_SAMPLES = 3                 # samples needed before the model is updated
-UA_SAMPLE_MIN_S = 7200             # 2 h between the two observation points
+# A shadow snapshot older than this is treated as stale (poller cadence is
+# 15 s, so anything beyond a few minutes means we are no longer getting data).
+STATE_STALE_SECONDS = 5 * 60
+# A computed plan older than this is flagged stale in cost/status surfaces.
+PLAN_STALE_AGE_S = 3 * 3600
+# Re-fetch the Open-Meteo forecast at most this often (the plan itself is
+# re-evaluated every poll against live water temperature using the cache).
+FORECAST_REFRESH_S = 3600
+# Throttle repeated spa-poll errors in the operation feed (log ~1 in N).
+POLL_ERR_LOG_EVERY = 20
+# Minimum spacing between automatic Bestway re-logins (the user opted into
+# this; it invalidates the phone app's session).
+REL_LOGIN_COOLDOWN_S = 600
+# When a login succeeds but Bestway returns no spa binding (the tub is offline
+# on their side, e.g. a wifi/network change), each re-login rotates the account
+# session for nothing — and can invalidate the phone app session the user needs
+# to reconnect the spa. Back off to this long interval instead.
+REL_LOGIN_BACKOFF_S = 3600
+# Minimum wall-clock span of plug meter history (h) before a 7-day measured
+# number (projected cost / saving) is trusted. With less data the window is
+# dominated by a restart/outage and would mislead.
+MEASURED_MIN_HOURS = 24
+# Online cooling-rate (UA) estimate from real heater-off coast-downs. A 1 h
+# span is enough to rise above the spa's 1 C temperature resolution, and a
+# "held steady" span (no measurable drop) is still used as an upper-bound
+# sample so a very well-insulated tub is learned, not ignored.
+UA_MIN_SAMPLES = 2                  # samples needed before the model is updated
+UA_SAMPLE_MIN_S = 3600               # 1 h between the two observation points
 UA_SAMPLE_MAX_S = 4 * 3600         # discard longer gaps (weather changed too much)
 UA_SAMPLE_MAX_N = 50               # rolling median window
 UA_BOUNDS = (0.005, 0.3)           # kW/degC, sane physical range
 UA_AMBIENT_MIN_DIFF = 3.0          # need a clear water/ambient difference
 UA_SETPOINT_MARGIN = 1.0           # only fit well above setpoint (thermostat idle)
+# Ongoing register telemetry (probe-offset investigation). The full raw
+# B*/P*/W* shadow is also persisted to shadow_log.jsonl every 5 min; this just
+# surfaces a rolling probe-vs-water summary in the operation feed.
+REG_PROBES = ("B1", "B2", "B9")
+REG_MON_INTERVAL_S = 3600          # how often to log a register summary
+REG_MAX_N = 288                    # rolling offset samples (~1 day of 5-min logs)
+REG_MIN_N = 6                      # samples before an offset baseline is trusted
+REG_ANOM_DELTA = 0.6               # probe offset shift (degC) that flags an anomaly
 NOTIFY_COOLDOWN_S = 3600           # Telegram "target reached" at most once/hr
 DAY_NAMES = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 WINDOW_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$")
@@ -57,6 +93,7 @@ DP_LOG_LABELS = {
 import scheduler  # noqa: E402
 import spa  # noqa: E402
 import notify  # noqa: E402
+import plug  # noqa: E402
 
 
 def heater_status(state):
@@ -70,6 +107,8 @@ def heater_status(state):
     """
     if not state:
         return "off"
+    if not spa.is_online(state):
+        return "offline"   # shadow says offline / cloud unreachable
     try:
         heat = int(state.get("heater_state") or 0)
     except (TypeError, ValueError):
@@ -131,21 +170,24 @@ def _float_setting(name, value, lo, hi):
     return n
 
 
-def cost_overview(cfg, plan, monthly_days=30):
+def cost_overview(cfg, plan, monthly_days=30, stale=False):
     """Estimated cost + saving vs 'always-on', using the configured price.
 
     `monthly_days` projects the plan-horizon figures to a rolling month.
+    `stale` marks the figures as derived from an old plan / offline tub, so
+    surfaces can show them as estimates rather than live truth.
     """
     price = float(cfg.get("PRICE_PER_KWH") or 0.0)
     if not plan:
-        return None
+        return {"price_per_kwh": price, "stale": True}
     plan_kwh = plan.get("energy_kwh")
     if not isinstance(plan_kwh, (int, float)):
-        return None
+        return {"price_per_kwh": price, "stale": True}
     days = len(plan.get("plan_ts") or []) / 24.0
     factor = monthly_days / max(1.0, days)
     c = {"price_per_kwh": price, "plan_kwh": plan_kwh, "cost_plan": plan_kwh * price,
-         "days": round(days, 1), "cost_monthly": plan_kwh * price * factor}
+         "days": round(days, 1), "cost_monthly": plan_kwh * price * factor,
+         "stale": bool(stale)}
     alwayson = plan.get("energy_alwayson_kwh")
     if isinstance(alwayson, (int, float)):
         cost_always = alwayson * price
@@ -172,7 +214,12 @@ def scheduler_payload(app):
         "floor": int(cfg["FLOOR_TEMP"]),
         "margin": float(cfg["MARGIN"]),
         "price_per_kwh": float(cfg.get("PRICE_PER_KWH") or 0.0),
-        "cost": cost_overview(cfg, app._plan),
+        "cost": cost_overview(cfg, app._plan, stale=app._plan_stale()),
+        "measured_cost": app._measured_cost_payload(),
+        "measured_kwh_24h": round(app.plug_kwh_window(24), 3),
+        "measured_kwh_7d": round(app.plug_kwh_window(168), 3),
+        "tub_online": app.tub_online(),
+        "state_age_s": app.state_age_s(),
         "location": cfg["LOCATION"],
         "lat": cfg["LAT"] if cfg["LAT"] is not None else app._lat,
         "lon": cfg["LON"] if cfg["LON"] is not None else app._lon,
@@ -204,6 +251,13 @@ class WebConfig:
         except (TypeError, ValueError):
             self.history_h = self.DEFAULTS["HISTORY_H"]
         self.mode = "auto" if str(self.mode).lower() == "auto" else "manual"
+        # Smart-plug (Tuya cloud) integration.
+        self.plug_device_id = env.get("TUYA_DEVICE_ID", "").strip()
+        self.plug_session = env.get("TUYA_SESSION", "").strip()
+        try:
+            self.plug_poll = float(env.get("PLUG_POLL", PLUG_POLL_SECONDS))
+        except (TypeError, ValueError):
+            self.plug_poll = PLUG_POLL_SECONDS
         # scheduler config (shared with scheduler.env values where present)
         self.scheduler_cfg = scheduler.load_config()
 
@@ -231,8 +285,27 @@ class SpaServer:
         self._plan_ts = 0.0
         self._tokens = None
         self._stopping = False
+        self._tub_online_prev = None     # last observed tub online state
+        self._poll_err = 0               # consecutive poll failures (log throttle)
+        self._notified_auth = False      # one-shot Telegram "tokens expired" alert
+        self._last_relogin = 0.0        # throttle automatic Bestway re-logins
+        self._forecast_weather = None   # cached hourly forecast (plan input)
+        self._forecast_ts = 0.0         # when the forecast cache was filled
         self._log = []              # recent operations, newest last
         self._log_lock = threading.Lock()
+        # smart plug (Tuya cloud) state
+        self._plugs = {}             # device_id -> latest normalised reading
+        self._plug_prev_state = {}   # device_id -> previous switch_on (notify)
+        self._plug_hist = []         # [{ts, watts, on, fault}] power samples
+        self._plug_kwh_today = 0.0   # integrated energy since local midnight
+        self._plug_kwh_day = None    # 'YYYY-MM-DD' the accumulator covers
+        self._plug_prev_ts = 0.0     # wall-clock of the previous successful read
+        self._plug_next = 0.0        # when to poll the plug next
+        self._plug_err = 0           # consecutive plug failures (log throttle)
+        # ongoing register telemetry (probe-offset investigation)
+        self._reg_bias = {k: [] for k in REG_PROBES}   # rolling offset samples
+        self._reg_offsets = {}       # last computed probe offsets vs water
+        self._reg_mon_ts = 0.0       # last register-summary log time
         # resolve location once (from scheduler.env: LOCATION or LAT/LON)
         try:
             lat, lon, where = scheduler.resolve_location(cfg.scheduler_cfg)
@@ -244,6 +317,10 @@ class SpaServer:
                         int(cfg.scheduler_cfg["TARGET_TEMP"])))
         self._telegram_poller()  # two-way bot commands if telegram.env set
         self._seed_history_from_log()  # don't wipe the history view on restart
+        self._seed_plug_history_from_log()  # measured 7-day power survives restarts
+        if plug.configured():
+            self.add_log("info",
+                         "Smart plug (Tuya cloud) enabled — integrating power usage")
 
     # -- state -----------------------------------------------------------
     def update_state(self, state):
@@ -270,16 +347,240 @@ class SpaServer:
         self._maybe_log_shadow(state)
         self._maybe_sample_ua(state)
         self._maybe_notify(state)
+        self._monitor_registers(state)
+        self._track_tub_online(state)
         self._broadcast("state")
 
     def get_state(self):
         with self._lock:
             return dict(self._state), self._state_ts
 
+    def state_age_s(self):
+        """Age of the last shadow snapshot in whole seconds, or None."""
+        return int(time.time() - self._state_ts) if self._state_ts else None
+
+    def tub_online(self, state=None, ts=None):
+        """A tub is 'live' only when the shadow is fresh *and* the device
+        itself reports online. Never call a 3-day-old snapshot 'online'."""
+        if state is None:
+            state = self._state
+        if ts is None:
+            ts = self._state_ts
+        if not state or not spa.is_online(state):
+            return False
+        if ts and time.time() - ts > STATE_STALE_SECONDS:
+            return False
+        return True
+
+    def _plan_stale(self):
+        """True when the cached plan is too old to trust for cost figures."""
+        if self._plan is None:
+            return True
+        if not self._plan_ts or time.time() - self._plan_ts > PLAN_STALE_AGE_S:
+            return True
+        return not self.tub_online()
+
+    def _track_tub_online(self, state):
+        """Detect online<->offline transitions: log them and (once only per
+        transition) ping Telegram so the user is told the tub fell off the
+        cloud or came back. Never raises."""
+        online = self.tub_online(state, int(time.time()))
+        prev = self._tub_online_prev
+        self._tub_online_prev = online
+        if prev is None or online == prev:
+            return
+        if online:
+            self.add_log("ok", "Tub back online")
+            msg = ("<b>Torronto</b> \U0001F30A\u00b7 the tub is <b>back online</b>.")
+        else:
+            self.add_log("warn",
+                         "Tub OFFLINE (device reports offline / cloud unreachable) "
+                         "\u2014 heating plan held, no commands sent")
+            msg = ("<b>Torronto</b> \u26a0\u00b7 the tub went <b>offline</b> \u2014 "
+                   "the cloud last heard from it a few minutes ago. Commands and "
+                   "auto-heating are paused until it reconnects.")
+        if notify.configured():
+            ok, err = notify.send_text(msg)
+            self.add_log("ok" if ok else "warn",
+                         "Telegram offline-alert %s (%s)"
+                         % ("sent" if ok else "failed: " + err,
+                            "online" if online else "offline"))
+        self._broadcast("log")
+
     def get_history(self, hours):
         cutoff = int(time.time()) - int(hours * 3600)
         with self._lock:
             return [dict(h) for h in self._history if h["ts"] >= cutoff]
+
+    # -- smart plug (Tuya cloud power meter) --------------------------------
+    def plug_enabled(self):
+        return plug.configured()
+
+    def update_plug(self, reading):
+        """Record a fresh plug reading; integrate kWh + notify on change.
+
+        ``reading`` is one normalised device dict from ``plug.read_all()``.
+        kWh is only integrated for the energy-meter plug ("Tub mains").
+        """
+        if not reading:
+            return
+        now = time.time()
+        self._roll_plug_day(now)  # outside the lock
+        reading = dict(reading)
+        reading["ts"] = int(now)
+        dev_id = reading.get("device_id")
+        self._maybe_notify_plug_change(reading)  # outside the lock
+        with self._lock:
+            if dev_id:
+                self._plugs[dev_id] = reading
+            if (plug.is_energy_device(reading.get("device"))
+                    and isinstance(reading.get("watts"), (int, float))):
+                sample = {
+                    "ts": int(now),
+                    "watts": reading.get("watts"),
+                    "on": bool(reading.get("switch_on")),
+                    "fault": reading.get("fault"),
+                }
+                if self._plug_prev_ts:
+                    dt_h = (now - self._plug_prev_ts) / 3600.0
+                    # Ignore huge gaps (server was down) to avoid phantom kWh.
+                    if 0 < dt_h <= 1.0:
+                        self._plug_kwh_today += reading["watts"] / 1000.0 * dt_h
+                self._plug_hist.append(sample)
+                self._plug_hist = [h for h in self._plug_hist
+                                   if h["ts"] > now - PLUG_HISTORY_SECONDS]
+                self._append_plug_log(sample)
+            self._plug_prev_ts = now
+        self._broadcast("plug")
+
+    def _append_plug_log(self, sample):
+        """Persist one power sample so 7-day measured kWh survives restarts."""
+        path = os.path.join(BASE_DIR, PLUG_LOG_FILE)
+        try:
+            with open(path, "a") as f:
+                f.write(json.dumps(sample, separators=(",", ":")) + "\n")
+        except OSError:
+            return
+        # Bound the file so it can't grow forever (~10 days of 15 s polls).
+        try:
+            if os.path.getsize(path) < (1 << 22):   # < 4 MB
+                return
+            with open(path) as f:
+                lines = [ln for ln in f if ln.strip()]
+            if len(lines) <= PLUG_LOG_MAX:
+                return
+            with open(path, "w") as f:
+                for ln in lines[-PLUG_LOG_MAX:]:
+                    f.write(ln)
+        except OSError:
+            pass
+
+    def _seed_plug_history_from_log(self):
+        """Reload measured power samples from plug_log.jsonl so the 24 h / 7 d
+        windows and sparkline are continuous across restarts."""
+        path = os.path.join(BASE_DIR, PLUG_LOG_FILE)
+        if not os.path.exists(path):
+            return
+        rows = []
+        try:
+            with open(path) as f:
+                for line in f:
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        pass
+        except OSError:
+            return
+        if not rows:
+            return
+        rows.sort(key=lambda r: r["ts"])
+        cutoff = int(time.time()) - PLUG_HISTORY_SECONDS
+        hist = [r for r in rows if r["ts"] >= cutoff]
+        if hist:
+            with self._lock:
+                if not self._plug_hist:
+                    self._plug_hist = hist
+                # continue the kWh integration from the last persisted sample
+                self._plug_prev_ts = float(hist[-1]["ts"])
+
+    def _maybe_notify_plug_change(self, reading):
+        """Send a Telegram alert when a plug relay toggles on/off."""
+        dev_id = reading.get("device_id")
+        name = reading.get("device")
+        on = bool(reading.get("switch_on"))
+        prev = self._plug_prev_state.get(dev_id)
+        self._plug_prev_state[dev_id] = on
+        if prev is None or prev == on or not notify.configured():
+            return
+        label = "ON" if on else "OFF"
+        msg = ("<b>Torronto</b> \U0001F50C · <b>%s</b> plug is now <b>%s</b>"
+               % (name, label))
+        ok, err = notify.send_text(msg)
+        self.add_log("ok" if ok else "warn",
+                     "Plug %s → %s (%s)"
+                     % (name, label, "sent" if ok else "failed: " + err))
+
+    def _roll_plug_day(self, now=None):
+        """Start a fresh kWh accumulator when the local day changes."""
+        now = now or time.time()
+        day = dt.datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+        if self._plug_kwh_day is None:
+            self._plug_kwh_day = day
+        elif self._plug_kwh_day != day:
+            self._plug_kwh_day = day
+            with self._lock:
+                self._plug_kwh_today = 0.0
+
+    def get_plugs(self):
+        now = time.time()
+        self._roll_plug_day(now)
+        with self._lock:
+            day = dt.datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+            kwh = self._plug_kwh_today if self._plug_kwh_day == day else 0.0
+            return {k: dict(v) for k, v in self._plugs.items()}, kwh
+
+    def get_plug_history(self, hours):
+        cutoff = int(time.time()) - int(hours * 3600)
+        with self._lock:
+            return [dict(h) for h in self._plug_hist if h["ts"] >= cutoff]
+
+    def plug_kwh_window(self, hours):
+        """Measured kWh over the last `hours`, integrated from live wattage.
+
+        This is the only source of the kWh figures used for cost: it comes from
+        the smart plug's real measured watts, never from heater on/off history.
+        """
+        cutoff = int(time.time()) - int(hours * 3600)
+        with self._lock:
+            pts = [h for h in self._plug_hist if h["ts"] >= cutoff]
+        kwh = 0.0
+        for i in range(1, len(pts)):
+            dt_h = (pts[i]["ts"] - pts[i - 1]["ts"]) / 3600.0
+            # Skip implausibly long gaps (server was down) and dead-zero days.
+            if 0 < dt_h <= 2.0:
+                kwh += (pts[i - 1].get("watts") or 0.0) / 1000.0 * dt_h
+        return kwh
+
+    def poll_plug(self):
+        """Fetch all configured plugs once over the Tuya cloud. Never raises."""
+        readings, err = None, ""
+        try:
+            readings = plug.read_all(self.cfg.plug_device_id)
+        except Exception as e:  # noqa: BLE001 - plug must never break the loop
+            err = str(e)
+        if readings:
+            self._plug_err = 0
+            for r in readings:
+                self.update_plug(r)
+            return
+        # Cloud unreachable: flag every known plug offline; log ~ every 6th.
+        with self._lock:
+            for k in self._plugs:
+                self._plugs[k] = dict(self._plugs[k], online=False)
+        self._plug_err += 1
+        if self._plug_err % 6 == 1:  # log ~ every 6th failure (~3 min apart)
+            self.add_log("warn", "Plug read failed%s"
+                         % (": " + err if err else ""))
 
     def _seed_history_from_log(self):
         """Backfill the in-memory history from the persisted shadow log.
@@ -421,12 +722,20 @@ class SpaServer:
     def _maybe_sample_ua(self, state):
         """Estimate the heat-loss coefficient (UA) from real coast-downs.
 
-        Pairs shadow readings roughly two hours apart while the tub is well
-        above its setpoint (so the thermostat cannot have been heating), and
-        keeps a rolling median. Once enough samples exist the fitted value is
-        saved to scheduler_model.json and used by the next replan.
+        Pairs shadow readings ~1 h apart while the tub is well above its
+        setpoint (so the thermostat cannot be heating), and keeps a rolling
+        median. A measured drop fits UA directly; a *held* temperature (no
+        measurable drop at the 1 C display resolution) is still strong evidence
+        of low heat loss, so it is fitted as an upper-bound sample using half
+        a degree (the most cooling we cannot rule out). Using an upper bound
+        keeps the plan safe (never schedules less heat than reality could
+        demand) while still learning great insulation. Once enough samples
+        exist the fitted value is saved to scheduler_model.json and used by the
+        next replan.
         """
         now = int(time.time())
+        if not spa.is_online(state):
+            return  # never fit thermal data from an offline/stale snapshot
         water = state.get("water_temperature")
         try:
             power = int(state.get("power_state") or 0)
@@ -462,8 +771,10 @@ class SpaServer:
         if min(t1, t2) <= max(sp1, sp2) + UA_SETPOINT_MARGIN:
             return  # thermostat may have called for heat during the span
         dT = t2 - t1
-        if dT > -0.5:
-            return  # no clear cooling at 1 C sensor resolution
+        hold = dT > -0.5   # no clear cooling at 1 C sensor resolution
+        if hold:
+            # Upper bound: assume the most cooling we cannot rule out (0.5 C).
+            dT = -0.5
         t_amb = prev["ambient"]
         if not isinstance(t_amb, (int, float)):
             return
@@ -489,8 +800,54 @@ class SpaServer:
         self.cfg.scheduler_cfg["UA_KW_PER_C"] = new_ua
         self._save_model_ua(new_ua)
         self.add_log("info",
-                     "Cooling rate measured: UA=%.4f kW/°C from %d coast-downs"
-                     % (new_ua, len(self._ua_samples)))
+                     "Cooling rate %s: UA=%.4f kW/°C from %d coast-down%s"
+                     % ("(held ≈ upper bound)" if hold else "measured",
+                        new_ua, len(self._ua_samples),
+                        "" if len(self._ua_samples) == 1 else "s"))
+
+    def _monitor_registers(self, state):
+        """Ongoing probe-vs-water offset telemetry for calibration work.
+
+        Each sample records how far B1/B2/B9 sit from the control probe
+        (water_temperature) into a rolling window. Roughly hourly we log a
+        concise summary to the operation feed (so it shows in the web UI and
+        /api/log without digging through shadow_log.jsonl) and flag any probe
+        whose offset has drifted from its established baseline. The full raw
+        B*/P*/W* shadow keeps being persisted to shadow_log.jsonl every 5 min.
+        """
+        now = time.time()
+        if not spa.is_online(state):
+            return  # skip probe-offset telemetry on offline snapshots
+        w = state.get("water_temperature")
+        if not isinstance(w, (int, float)):
+            return
+        for key in REG_PROBES:
+            v = state.get(key)
+            if not isinstance(v, (int, float)) or abs(v - w) > 8:
+                continue
+            buf = self._reg_bias[key]
+            buf.append(v - w)
+            if len(buf) > REG_MAX_N:
+                del buf[:len(buf) - REG_MAX_N]
+        baselines = {}
+        for key in REG_PROBES:
+            buf = self._reg_bias[key]
+            if len(buf) >= REG_MIN_N:
+                baselines[key] = statistics.median(buf)
+        self._reg_offsets = baselines
+        if now - self._reg_mon_ts < REG_MON_INTERVAL_S or not baselines:
+            return
+        self._reg_mon_ts = now
+        parts = []
+        for key in REG_PROBES:
+            o = baselines[key]
+            recent = self._reg_bias[key][-12:]
+            r = statistics.median(recent) if recent else o
+            flag = " \u26a0" if abs(r - o) >= REG_ANOM_DELTA else ""
+            parts.append("%s%+.1f%s" % (key, o, flag))
+        self.add_log("info",
+                     "registers: water=%s \u00b7 %s (offset vs control probe, n=%d)"
+                     % (w, " ".join(parts), len(self._reg_bias["B1"])))
 
     def _maybe_notify(self, state):
         """Telegram 'tub reached target' alert, at most once per hour.
@@ -503,6 +860,9 @@ class SpaServer:
             self._prev_water = state.get("water_temperature")
             return
         now = time.time()
+        if not spa.is_online(state):
+            self._prev_water = state.get("water_temperature")
+            return  # never claim "target reached" from an offline snapshot
         water = state.get("water_temperature")
         target = self.cfg.scheduler_cfg.get("TARGET_TEMP")
         phase = (self._plan or {}).get("phase") if self._plan else None
@@ -564,6 +924,12 @@ class SpaServer:
         lines = [
             "<b>Torronto</b> \U0001F30A status",
             "mode: <b>%s</b> · phase: %s" % (self.cfg.mode.upper(), phase),
+        ]
+        if not self.tub_online():
+            age = self.state_age_s()
+            lines.append("⚠ tub <b>offline</b> · last data %s"
+                         % ("%.0fh ago" % (age / 3600.0) if age else "unknown"))
+        lines += [
             "water: <b>%s°C</b> (device target %s°C)" % (water, dev_target or "?"),
             "heater: %s · power: %s · filter: %s" % (
                 heat, "on" if power else "off",
@@ -599,18 +965,34 @@ class SpaServer:
 
     def _tg_cost(self):
         cfg = self.cfg.scheduler_cfg
-        c = cost_overview(cfg, self._plan)
+        c = cost_overview(cfg, self._plan, stale=self._plan_stale())
         price = float(cfg.get("PRICE_PER_KWH") or 0.0)
-        if not c:
-            return ("<b>Torronto</b> cost\n"
-                    "price: \u00A3%.4f/kWh\nplan not ready yet" % price)
         lines = ["<b>Torronto</b> cost @ \u00A3%.4f/kWh" % price]
+        # Measured consumption is the ground truth when the plug is enabled:
+        # it comes from the smart meter's real draw, never from heater on/off
+        # history or from the (predictive) plan.
+        if self.plug_enabled():
+            m7 = round(self.plug_kwh_window(168), 2)
+            m24 = round(self.plug_kwh_window(24), 2)
+            lines.append("measured (plug) 24h: %.2f kWh \u00B7 \u00A3%.2f"
+                         % (m24, price * m24))
+            lines.append("measured (plug) 7d : %.2f kWh \u00B7 \u00A3%.2f"
+                         % (m7, price * m7))
+        if not self._plan:
+            lines.append("no heating plan yet \u2014 run /plan or wait for the next replan")
+            return "\n".join(lines)
+        if c.get("stale"):
+            age = "" if not self._plan_ts else " (%.0fh old)" % max(
+                0.0, (time.time() - self._plan_ts) / 3600.0)
+            state = "tub offline" if not self.tub_online() else "plan stale"
+            lines.append("\u26a0 %s%s \u2014 projected plan figures below are estimates"
+                         % (state, age))
         lines.append("plan (%.1fd): %.1f kWh \u00B7 \u00A3%.2f"
                      % (c["days"], c["plan_kwh"], c["cost_plan"]))
         if "cost_alwayson" in c:
-            lines.append("always-on would be: %.1f kWh \u00B7 \u00A3%.2f"
+            lines.append("always-on baseline: %.1f kWh \u00B7 \u00A3%.2f"
                          % (c["alwayson_kwh"], c["cost_alwayson"]))
-            lines.append("saving: \u00A3%.2f (%.0f%%)"
+            lines.append("plan saving: \u00A3%.2f (%.0f%%)"
                          % (c["saving_cost"], c["saving_pct"]))
             lines.append("projected month: plan \u00A3%.2f \u00B7 save \u00A3%.2f"
                          % (c["cost_monthly"], c["saving_monthly"]))
@@ -745,11 +1127,25 @@ class SpaServer:
         self._sse_clients.discard(q)
 
     # -- plan --------------------------------------------------------------
-    def refresh_plan(self, apply=False):
-        """Run one scheduler step (weather + plan; apply only if auto mode)."""
+    def refresh_plan(self, apply=False, force_weather=False):
+        """Recompute the heating plan from the *current* state.
+
+        The weather forecast is cached and only re-fetched hourly (or when
+        ``force_weather`` is set, e.g. an explicit /replan or settings edit),
+        so calling this frequently to track live water temperature is cheap.
+        Commands are only sent when the plan changed versus the device state.
+        """
+        cfg = self.cfg.scheduler_cfg
+        horizon_days = max(3, (int(cfg["HORIZON_H"]) + 23) // 24)
+        now = time.time()
+        if (force_weather or self._forecast_weather is None
+                or now - self._forecast_ts > FORECAST_REFRESH_S):
+            self._forecast_weather = scheduler.fetch_forecast(
+                self._lat, self._lon, forecast_days=horizon_days)
+            self._forecast_ts = time.time()
         res = scheduler.scheduler_step(
-            self.cfg.scheduler_cfg, self._lat, self._lon, state=self.get_state()[0],
-            tokens=self._get_tokens(), apply=apply)
+            cfg, self._lat, self._lon, state=self.get_state()[0],
+            tokens=self._get_tokens(), apply=apply, weather=self._forecast_weather)
         self._plan = res
         self._plan_ts = time.time()
         # Keep forecast ambient for hours that have just left the plan window,
@@ -901,7 +1297,7 @@ class SpaServer:
 
         replanned, plan_error = False, None
         try:
-            self.refresh_plan(apply=(self.cfg.mode == "auto"))
+            self.refresh_plan(apply=(self.cfg.mode == "auto"), force_weather=True)
             replanned = True
         except Exception as e:
             plan_error = str(e)
@@ -924,6 +1320,78 @@ class SpaServer:
             self._tokens = spa.get_tokens()
         return self._tokens
 
+    def _invalidate_tokens(self):
+        """Drop the cached token so the next call re-reads tokens.json."""
+        self._tokens = None
+
+    def _measured_cost_payload(self):
+        """Measured spend + saving vs the always-on baseline (same basis).
+
+        Gated on MEASURED_MIN_HOURS of real plug history: with less data the
+        rolling 7-day window (and any "saving") is dominated by a restart or
+        outage and would show a misleading £0/100%.
+        """
+        cfg = self.cfg.scheduler_cfg
+        price = float(cfg.get("PRICE_PER_KWH") or 0.0)
+        with self._lock:
+            hist = list(self._plug_hist)
+        if not hist or price <= 0:
+            return {"enough": False, "coverage_h": 0.0}
+        span_h = (hist[-1]["ts"] - hist[0]["ts"]) / 3600.0
+        m7 = self.plug_kwh_window(168)
+        enough = span_h >= MEASURED_MIN_HOURS
+        out = {"enough": enough, "coverage_h": round(span_h, 1),
+               "measured_kwh_7d": round(m7, 3),
+               "monthly_cost": round(price * m7 * 30.0 / 7.0, 2)}
+        plan = self._plan or {}
+        alwayson = plan.get("energy_alwayson_kwh")
+        days = len(plan.get("plan_ts") or []) / 24.0
+        if enough and isinstance(alwayson, (int, float)) and days > 0:
+            ao_monthly = alwayson * price * 30.0 / days
+            saving = max(0.0, ao_monthly - out["monthly_cost"])
+            out["saving_monthly"] = round(saving, 2)
+            out["saving_pct"] = round(saving / ao_monthly * 100.0, 1) if ao_monthly > 0 else 0.0
+        return out
+
+    def _auto_relogin(self):
+        """Refresh the Bestway session from secrets.env (opt-in behaviour).
+
+        The user chose to let the server re-login automatically even though a
+        new session invalidates the phone app's. Throttled by
+        REL_LOGIN_COOLDOWN_S so a revoked token doesn't hammer the login API.
+        Never raises. Returns True when the cache was refreshed.
+        """
+        if time.time() - self._last_relogin < REL_LOGIN_COOLDOWN_S:
+            return False
+        self._last_relogin = time.time()
+        try:
+            tokens = spa.get_tokens(force=True)   # logs in, rewrites tokens.json
+        except spa.SpaError as e:
+            msg = str(e)
+            if "no spa binding returned" in msg:
+                # Login works but Bestway has no spa bound: the tub is offline
+                # on their side (e.g. the wifi changed and it has not rejoined
+                # the cloud). Retrying every 10 min just keeps rotating the
+                # account session — which can invalidate the phone app session
+                # mid-fix — for no benefit, so back off to hourly.
+                self._last_relogin = (time.time() - REL_LOGIN_COOLDOWN_S
+                                      + REL_LOGIN_BACKOFF_S)
+                self.add_log("warn", "Auto re-login: account OK but no spa bound "
+                                     "(offline/wifi?) — will retry hourly. %s"
+                             % msg[:200])
+                return False
+            self.add_log("err", "Auto re-login failed: %s" % msg)
+            return False
+        except Exception as e:  # noqa: BLE001 - never break the poller
+            self.add_log("err", "Auto re-login failed: %s" % e)
+            return False
+        self._tokens = tokens
+        self.add_log("ok", "Auto re-login succeeded — tokens refreshed")
+        if notify.configured():
+            notify.send_text("<b>Torronto</b> \U0001F501 api token refreshed "
+                             "automatically (re-login).")
+        return True
+
 
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -935,7 +1403,7 @@ class _Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path in ("/api/state", "/api/health", "/api/history", "/api/history/registers",
                     "/api/plan", "/api/scheduler", "/api/weather", "/api/log",
-                    "/api/location/search"):
+                    "/api/plug", "/api/location/search"):
             self._api(path)
         elif path == "/api/events":
             self._sse()
@@ -966,12 +1434,19 @@ class _Handler(BaseHTTPRequestHandler):
         app = self.server.app
         if path == "/api/state":
             state, ts = app.get_state()
+            plugs, plug_kwh = app.get_plugs()
             out = {
                 "ts": int(ts),
                 "mode": app.cfg.mode,
+                "tub_online": app.tub_online(),
+                "state_age_s": app.state_age_s(),
                 "state": state,
                 "heater": heater_status(state),
                 "plan_ts": int(app._plan_ts) if app._plan else None,
+                "plugs": plugs,
+                "plug_kwh_today": plug_kwh,
+                "plug_kwh_7d": round(app.plug_kwh_window(168), 3),
+                "register_offsets": dict(app._reg_offsets),
             }
             if app._plan:
                 out["phase"] = app._plan["phase"]
@@ -980,15 +1455,32 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/health":
             state, ts = app.get_state()
             self._send_json(200, {
-                "online": bool(state),
+                "online": bool(state) and app.tub_online(state, ts),
+                "tub_online": app.tub_online(),
+                "connect": state.get("ConnectType"),
+                "is_online": state.get("is_online"),
                 "last_update": int(ts),
                 "age_s": int(time.time() - ts) if ts else None,
                 "mode": app.cfg.mode,
+                "plan_age_s": int(time.time() - app._plan_ts) if app._plan_ts else None,
             })
         elif path == "/api/history":
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             hours = float(qs.get("range", ["24"])[0])
-            self._send_json(200, {"series": app.get_history(min(hours, 168))})
+            hours = min(hours, 168)
+            self._send_json(200, {
+                "series": app.get_history(hours),
+                "plug": app.get_plug_history(hours),
+            })
+        elif path == "/api/plug":
+            plugs, plug_kwh = app.get_plugs()
+            self._send_json(200, {
+                "enabled": plug.configured(),
+                "plugs": plugs,
+                "kwh_today": round(plug_kwh, 4),
+                "kwh_24h": round(app.plug_kwh_window(24), 4),
+                "kwh_7d": round(app.plug_kwh_window(168), 4),
+            })
         elif path == "/api/plan":
             if app._plan is None:
                 try:
@@ -1077,13 +1569,13 @@ class _Handler(BaseHTTPRequestHandler):
             app._broadcast("mode")
             if mode == "auto":
                 try:
-                    app.refresh_plan(apply=True)
+                    app.refresh_plan(apply=True, force_weather=True)
                 except Exception as e:
                     app.add_log("err", "Auto start failed: %s" % e)
                     return self._send_json(502, {"error": "auto-start failed: %s" % e})
         if body.get("replan"):
             try:
-                app.refresh_plan(apply=(app.cfg.mode == "auto"))
+                app.refresh_plan(apply=(app.cfg.mode == "auto"), force_weather=True)
                 app.add_log("info", "Heating plan recomputed")
             except Exception as e:
                 app.add_log("err", "Replan failed: %s" % e)
@@ -1143,29 +1635,66 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def _poller_loop(app, stop_event):
-    """Periodically fetch the shadow and append history.
+    """Periodically fetch the shadow, append history, and re-evaluate the plan.
 
-    The shadow is polled every POLL_SECONDS; the heating plan (which costs a
-    weather API call) is refreshed at most once per hour, unless a replan is
-    explicitly requested.
+    The shadow is polled every POLL_SECONDS. The heating plan is re-evaluated
+    on every poll against the live water temperature (the weather forecast is
+    cached hourly server-side), so phase/setting/heater decisions track the
+    tub instead of an hour-old snapshot.
     """
-    next_plan = 0.0  # always refresh on first iteration
     while not stop_event.is_set():
         now = time.time()
         try:
             state = spa.shadow(app._get_tokens())
+            app._poll_err = 0
+            app._notified_auth = False     # auth recovered -> can alert again later
             app.update_state(state)
+        except SystemExit as e:
+            # Defensive: a stray sys.exit (e.g. a library path we missed) must
+            # never take down monitoring / auto-heating with it.
+            print("[%s] poller exit: %s" % (time.strftime("%F %T"), e), flush=True)
+            app.add_log("err", "Spa poll exited: %s" % e)
         except Exception as e:
-            print("[%s] poller error: %s" % (time.strftime("%F %T"), e), flush=True)
-            app.add_log("err", "Spa poll failed: %s" % e)
-        # plan refresh aligned to hour boundaries (weather API budget + so the
-        # preheat/window transitions are picked up on time)
-        if now >= next_plan:
+            # Log throttled (~1 in POLL_ERR_LOG_EVERY) so a DNS/cloud outage
+            # doesn't flood the operation feed, but keep trying every poll.
+            app._poll_err += 1
+            if spa.is_auth_error(e):
+                # Token expired/revoked: drop the cached token and re-login
+                # automatically (throttled), so the service self-heals instead
+                # of waiting for a human.
+                app._invalidate_tokens()
+                if not app._notified_auth and notify.configured():
+                    app._notified_auth = True
+                    notify.send_text(
+                        "<b>Torronto</b> \u26a0 api token expired or revoked "
+                        "\u2014 attempting an automatic re-login.")
+                app._auto_relogin()
+            if app._poll_err % POLL_ERR_LOG_EVERY == 1:
+                msg = str(e)
+                if spa.is_auth_error(e):
+                    note = ("Spa tokens expired/revoked \u2014 attempting "
+                            "automatic re-login")
+                else:
+                    note = "Spa poll failed"
+                print("[%s] %s: %s" % (time.strftime("%F %T"), note, e), flush=True)
+                app.add_log("err", "%s: %s" % (note, e))
+        # plan refresh: re-evaluate on EVERY poll so the plan tracks the live
+        # water temperature / phase (the weather feed is cached hourly inside
+        # refresh_plan, so this is cheap). Previously this only ran once an
+        # hour, so the plan could say "heat" long after the tub was hot.
+        try:
+            app.refresh_plan(apply=(app.cfg.mode == "auto"))
+        except SystemExit as e:
+            app.add_log("err", "Plan refresh exited: %s" % e)
+        except Exception:
+            pass
+        # smart-plug (Tuya cloud) power polling
+        if app.plug_enabled() and now >= app._plug_next:
+            app._plug_next = now + app.cfg.plug_poll
             try:
-                app.refresh_plan(apply=(app.cfg.mode == "auto"))
-            except Exception:
+                app.poll_plug()
+            except Exception:  # noqa: BLE001 - never let the plug stop the loop
                 pass
-            next_plan = now - (now % 3600) + 3600  # top of next hour
         stop_event.wait(POLL_SECONDS)
 
 
@@ -1191,6 +1720,9 @@ def main():
           % (bind, port, cfg.mode), flush=True)
     print("  API: /api/state /api/history /api/plan /api/scheduler /api/cmd", flush=True)
     print("  SPA: http://%s:%d/" % (bind, port), flush=True)
+    if plug.configured():
+        print("  Plug: Tuya cloud power meter (poll every %gs)"
+              % cfg.plug_poll, flush=True)
 
     stop = threading.Event()
     t = threading.Thread(target=_poller_loop, args=(app, stop), daemon=True)

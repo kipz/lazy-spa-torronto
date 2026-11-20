@@ -73,28 +73,9 @@
             <span class="fact-v" id="factWeather">—</span>
           </div>
           <div class="fact">
-            <span class="fact-k">energy (plan)</span>
+            <span class="fact-k">energy today</span>
             <span class="fact-v" id="factEnergy">—</span>
           </div>
-        </div>
-      </section>
-
-      <!-- ======= Chart ======= -->
-      <section class="chart-card glass">
-        <div class="chart-head">
-          <h2>📈 History</h2>
-          <div class="range-pills" id="rangePills">
-            <button class="pill-btn active" data-range="6">6h</button>
-            <button class="pill-btn" data-range="24">24h</button>
-            <button class="pill-btn" data-range="72">3d</button>
-            <button class="pill-btn" data-range="168">7d</button>
-          </div>
-        </div>
-        <canvas id="chart"></canvas>
-        <div class="legend">
-          <span class="lg"><i class="sw water"></i>water</span>
-          <span class="lg"><i class="sw ambient"></i>ambient</span>
-          <span class="lg"><i class="sw target"></i>target</span>
         </div>
       </section>
 
@@ -115,6 +96,25 @@
           model — an estimate, not a metered value.</p>
       </section>
 
+      <!-- ======= Smart plugs / energy ======= -->
+      <section class="chart-card glass" id="plugCard">
+        <div class="chart-head">
+          <h2>🔌 Smart plugs</h2>
+          <span class="hint" id="plugStatus">—</span>
+        </div>
+        <div id="plugList" class="plug-list"></div>
+        <div class="plug-energy">
+          <span>today <b id="plugKwh">—</b></span>
+          <span>cost <b id="plugCost">—</b></span>
+        </div>
+        <canvas id="plugChart"></canvas>
+        <p class="hint">Mains power &amp; energy are measured by the garden smart
+          plug feeding the tub, read over the Tuya cloud (it sits behind the
+          garden router's NAT, so it isn't reachable on the LAN). “today” is kWh
+          since local midnight, integrated from the live wattage. Relay state
+          changes are pushed to Telegram.</p>
+      </section>
+
       <!-- ======= Forecast & heating plan ======= -->
       <section class="chart-card glass" id="forecastCard">
         <div class="chart-head">
@@ -131,7 +131,8 @@
           <span class="lg"><i class="sw fc-amb"></i>ambient</span>
           <span class="lg"><i class="sw fc-feels"></i>feels like</span>
           <span class="lg"><i class="sw fc-water"></i>projected water</span>
-          <span class="lg"><i class="sw fc-heater"></i>heater ON</span>
+          <span class="lg"><i class="sw fc-heat"></i>preheat (heating up)</span>
+          <span class="lg"><i class="sw fc-hold"></i>maintain target</span>
           <span class="lg"><i class="sw fc-window"></i>use window</span>
           <span class="lg"><i class="sw fc-preheat"></i>preheat</span>
           <span class="lg"><i class="sw fc-frost"></i>0° frost</span>
@@ -179,10 +180,20 @@
             <div class="auto-row"><span>target / eco / floor</span><code id="cfgTemps">—</code></div>
             <div class="auto-row"><span>margin</span><code id="cfgMargin">—</code></div>
             <div class="auto-row"><span>overrides</span><code id="cfgOverrides">none</code></div>
-            <div class="auto-row"><span>energy cost</span><code id="cfgCost">—</code></div>
-            <div class="auto-row" title="Estimated saving vs leaving the heater at target 24/7">
-              <span>saved vs always-on</span>
+            <div class="auto-row" title="Measured today by the smart plug (real draw), local midnight to now">
+              <span>energy (today)</span><code id="cfgCost">—</code>
+            </div>
+            <div class="auto-row" title="Measured over the last 7 days by the smart plug (real draw)">
+              <span>energy (7d)</span>
               <span class="m-row"><code id="cfgSaving">—</code></span>
+            </div>
+            <div class="auto-row" title="Model-projected cost over a rolling 30 days (plan energy trimmed to a month). Labelled as an estimate when the plan is stale or the tub is offline.">
+              <span>projected cost (30d)</span>
+              <span class="m-row"><code id="cfgMonthly">—</code></span>
+            </div>
+            <div class="auto-row" title="Plan energy vs the always-on baseline, projected to a rolling 30 days">
+              <span>saved vs always-on (30d)</span>
+              <span class="m-row"><code id="cfgSaving30">—</code></span>
             </div>
             <div class="auto-row"><span>location</span><a id="cfgLocation" class="loc-link" href="#" target="_blank" rel="noopener" title="">—</a></div>
             <div id="autoDevices" class="auto-devices" aria-label="device states"></div>
@@ -196,8 +207,9 @@
           <div id="planStrip" class="plan-strip" title="Heater ON blocks (next 24h)"></div>
           <div id="planAxis" class="plan-axis" aria-hidden="true"></div>
           <div class="plan-legend">
-            <span><i class="sw on"></i>heater ON</span>
-            <span><i class="sw off"></i>eco/off</span>
+            <span><i class="sw heat"></i>preheat</span>
+            <span><i class="sw hold"></i>at target</span>
+            <span><i class="sw off"></i>off</span>
           </div>
         </div>
       </section>

@@ -352,19 +352,22 @@ class TestOptimalStart(unittest.TestCase):
 
 
 # --- calibration -------------------------------------------------------------
-def _row(ts, water, heater_state, power=1):
+def _row(ts, water, heater_state, power=1, temperature_setting=28):
     return {"ts": ts, "shadow": {
-        "water_temperature": water, "heater_state": heater_state, "power_state": power}}
+        "water_temperature": water, "temperature_setting": temperature_setting,
+        "heater_state": heater_state, "power_state": power}}
 
 
 class TestCalibrate(unittest.TestCase):
     def test_fits_ua_from_coastdown(self):
+        # The spa's probe is 1 C resolution, so an offline fit must pair
+        # snapshots HOURS apart to see the ~1 C/h cooling of this tub.
         cfg = make_cfg(C_KWH_PER_C=1.45)
         ua_true, t_amb = 0.05, 10.0
         rows, ts = [], ts_at(0)
         T = 38.0
         for _ in range(8):
-            rows.append(_row(ts, T, heater_state=0, power=0))
+            rows.append(_row(ts, T, heater_state=0, power=1))
             T -= ua_true * (T - t_amb) / cfg["C_KWH_PER_C"]
             ts += 3600
         weather = {ts_at(0) + i * 3600: (t_amb, 0, 0) for i in range(8)}
@@ -589,6 +592,47 @@ class TestSchedulerStep(unittest.TestCase):
         self.assertNotIn(("heater_state", 0), calls)
         # freeze protection actively keeps heat on when the heater is off
         self.assertIn(("heater_state", 1), calls)
+
+    def test_settle_prevents_rapid_setting_flip(self):
+        # The plan is re-fitted every poll, so the preheat/eco phase can
+        # alternate while the 1 C water reading sits on the "can it coast?"
+        # boundary. SCHED_SETTLE_S must stop the scheduler from flipping the
+        # device setting back and forth: at most one change per 30 minutes.
+        cfg = make_cfg(TARGET_TEMP=40, ECO_TEMP=28, FLOOR_TEMP=8)
+        cmd_state = {}
+        clock = {"now": ts_at(15)}
+        state = {"water_temperature": 38.0, "power_state": 1,
+                 "temperature_setting": 28, "heater_state": 0, "filter_state": 2}
+        def _cmd(_tokens, dp, val):   # device reflects commands in the shadow
+            state[dp] = val
+        mock_spa = mock.MagicMock()
+        mock_spa.send_command.side_effect = _cmd
+        def run(phase):
+            with mock.patch.dict(sys.modules, {"spa": mock_spa}), \
+                 mock.patch.object(scheduler.time, "time", lambda: clock["now"]), \
+                 mock.patch.object(scheduler, "fetch_forecast",
+                                   return_value=self._mock_weather()), \
+                 mock.patch.object(scheduler, "hot_phase_now",
+                                   return_value=phase):
+                return scheduler.scheduler_step(
+                    cfg, 51.5, -0.12, state=state, apply=True,
+                    cmd_state=cmd_state)
+        # 15:00 preheat -> setpoint raised to 40, heater on
+        r1 = run("preheat")
+        self.assertTrue(r1["changed"])
+        self.assertEqual(state["temperature_setting"], 40)
+        # 15:01 the boundary flips to eco -> the 40->28 flip must be held back
+        clock["now"] += 60
+        mock_spa.send_command.reset_mock()
+        r2 = run("eco")
+        self.assertFalse(r2["changed"])
+        mock_spa.send_command.assert_not_called()
+        self.assertEqual(state["temperature_setting"], 40)   # held at 40
+        # 30+ minutes later the eco transition is allowed again
+        clock["now"] += 1800 + 10
+        r3 = run("eco")
+        self.assertTrue(r3["changed"])
+        self.assertEqual(state["temperature_setting"], 28)
 
     def test_eco_cooling_commands_are_idempotent(self):
         # When everything already matches the plan, scheduler_step sends nothing

@@ -67,6 +67,12 @@ DEFAULTS = {
     "PRICE_PER_KWH": 0.2263,        # GBP per kWh (edited in the UI; ~22.6p rate)
     "STEP_H": 1.0,                  # control timestep (hours)
     "LOG_FILE": "scheduler.log",
+    # Minimum seconds between state-changing commands the scheduler sends to
+    # the spa. The plan is re-evaluated every poll, so the bang-bang preheat
+    # boundary can thrash (setting alternating 40/28, heater clicking) as the
+    # 1 C water reading sits on the "can it coast a bit longer?" line. This
+    # settles it: at most one flip per datapoint per window.
+    "SCHED_SETTLE_S": 1800,         # = 30 minutes
 }
 
 HOUR = 3600.0
@@ -125,7 +131,8 @@ def load_config():
     cfg.update(load_env(os.path.join(BASE_DIR, "scheduler.env")))
     for k in ("TARGET_TEMP", "ECO_TEMP", "FLOOR_TEMP", "MARGIN",
               "C_KWH_PER_C", "P_HEAT_KW", "UA_KW_PER_C", "WIND_SENSITIVITY",
-              "SOLAR_GAIN_KW", "HORIZON_H", "STEP_H", "PRICE_PER_KWH"):
+              "SOLAR_GAIN_KW", "HORIZON_H", "STEP_H", "PRICE_PER_KWH",
+              "SCHED_SETTLE_S"):
         try:
             cfg[k] = float(cfg[k])
         except (TypeError, ValueError):
@@ -369,6 +376,28 @@ def in_window(ts, windows):
 
 
 # --- thermal model -------------------------------------------------------------
+def ua_from_pair(C, T1, T2, t_amb, dt_h):
+    """Heat-loss coefficient (kW/degC) from one heater-off coast-down pair.
+
+    Uses the exact Newton-cooling solution for constant ambient over the span
+    (T2 = T_amb + (T1 - T_amb) * exp(-UA*t/C)), which stays accurate over the
+    several-hour spans the spa's 1 C sensor resolution requires -- a linear
+    secant over those spans systematically over-estimates UA. Falls back to
+    the secant when the water is at/under ambient (no room to divide).
+    """
+    dT = T1 - T2
+    if dT <= 0 or dt_h <= 0:
+        return None
+    if T2 <= t_amb:
+        # Water at/under ambient: loss is tiny; fit the linear slope instead.
+        denom = dt_h * (T1 - t_amb)
+        return C * dT / denom if denom > 0 else None
+    numerator = math.log((T1 - t_amb) / (T2 - t_amb))
+    if numerator <= 0:
+        return None
+    return C * numerator / dt_h
+
+
 def make_ua(cfg, wind_ms=0.0):
     ua = cfg["UA_KW_PER_C"]
     if cfg["WIND_SENSITIVITY"]:
@@ -513,6 +542,12 @@ def calibrate_model(cfg, rows, weather):
     """Fit UA (heat loss) from heater-off coast-down stretches and P from
     genuine heating-phase stretches (temp rising, heater on).
 
+    The spa's control probe reports whole degrees C, so consecutive 5-min
+    snapshots cannot resolve the ~0.1-0.2 C/h cooling of a well-insulated
+    tub -- pair readings HOURS apart instead. A "held steady" span (no
+    measurable drop) is fitted as an upper-bound sample using the most
+    cooling we cannot rule out (0.5 C over the whole span), which keeps the
+    fitted UA slightly above reality rather than several times above it.
     Holding stretches (heater on, temp ~constant at setpoint) are excluded
     from the P fit -- they measure loss-compensating power, not the heater's
     full output. Returns (ua, p, n_ua, n_p). Falls back to config defaults
@@ -520,6 +555,70 @@ def calibrate_model(cfg, rows, weather):
     """
     C = cfg["C_KWH_PER_C"]
     ua_samples, p_samples = [], []
+    heat_states = ("1", "2", "3", "5", "6", "7", "8")
+    n = len(rows)
+
+    def _amb(ts):
+        t = int(ts) - (int(ts) % 3600)
+        hit = weather.get(t) or [None]
+        return hit[0]
+
+    # --- UA: pair snapshots several hours apart ---------------------------
+    for j in range(1, n):
+        row2 = rows[j]
+        s2 = row2["shadow"]
+        T2 = s2.get("water_temperature")
+        if not isinstance(T2, (int, float)):
+            continue
+        w2 = s2.get("temperature_setting")
+        p2 = s2.get("power_state")
+        h2 = str(s2.get("heater_state") or "")
+        if p2 not in (1, "1") or h2 in heat_states:
+            continue
+        # newest earlier snapshot 3-8 h back (long enough to resolve 1 C)
+        ref = None
+        for i in range(j - 1, -1, -1):
+            span_h = (row2["ts"] - rows[i]["ts"]) / 3600.0
+            if span_h > 8.0:
+                break
+            if span_h >= 3.0:
+                ref = rows[i]
+                break
+        if ref is None:
+            continue
+        s1 = ref["shadow"]
+        T1 = s1.get("water_temperature")
+        if not isinstance(T1, (int, float)):
+            continue
+        if s1.get("power_state") not in (1, "1"):
+            continue
+        if str(s1.get("heater_state") or "") in heat_states:
+            continue
+        sp1, sp2 = s1.get("temperature_setting"), w2
+        if not isinstance(sp1, (int, float)) or not isinstance(sp2, (int, float)):
+            continue
+        if min(T1, T2) <= max(sp1, sp2) + 1.0:
+            continue  # thermostat may have called for heat during the span
+        a1, a2 = _amb(ref["ts"]), _amb(row2["ts"])
+        t_amb = a1 if a1 is not None and a2 is None \
+            else a2 if a2 is not None and a1 is None \
+            else (a1 + a2) / 2.0 if a1 is not None and a2 is not None else None
+        if not isinstance(t_amb, (int, float)):
+            continue
+        Tavg = (T1 + T2) / 2.0
+        if abs(Tavg - t_amb) <= 3.0:
+            continue
+        dt_h = (row2["ts"] - ref["ts"]) / 3600.0
+        if dt_h <= 0.05:
+            continue
+        dT = T2 - T1
+        if dT > -0.5:
+            T2 = T1 - 0.5        # held: upper bound of the unmeasurable drop
+        ua = ua_from_pair(C, T1, T2, t_amb, dt_h)
+        if ua is not None and 0.001 <= ua <= 0.3:
+            ua_samples.append(ua)
+
+    # --- P: genuine heating stretches (temp clearly rising, element on) ---
     for prev, cur in zip(rows, rows[1:]):
         s1, s2 = prev["shadow"], cur["shadow"]
         dt_h = (cur["ts"] - prev["ts"]) / 3600.0
@@ -528,27 +627,21 @@ def calibrate_model(cfg, rows, weather):
         T1, T2 = s1.get("water_temperature"), s2.get("water_temperature")
         if not isinstance(T1, (int, float)) or not isinstance(T2, (int, float)):
             continue
-        t = int(prev["ts"]) - (int(prev["ts"]) % 3600)
-        t_amb = (weather.get(t) or [None])[0]
+        t_amb = _amb(prev["ts"])
         if t_amb is None:
             continue
         dT = T2 - T1
         rate = dT / dt_h                       # degC/hour
-        heat_on = (s1.get("power_state") in (1, "1")) and (s1.get("heater_state") not in (0, "0", None))
+        heat_on = (s1.get("power_state") in (1, "1")) \
+            and str(s1.get("heater_state") or "") in heat_states
         Tavg = (T1 + T2) / 2.0
         if not heat_on:
-            # clean coast-down: falling, not a fast sensor transient
-            if rate < -0.05 and abs(Tavg - t_amb) > 3.0:
-                ua = C * (-rate) / (Tavg - t_amb)   # kW/degC
-                if 0.005 <= ua <= 0.3:
-                    ua_samples.append(ua)
-        else:
-            # genuine heating phase only: temp clearly rising
-            if rate > 0.05:
-                ua = cfg["UA_KW_PER_C"]
-                p = C * rate + ua * (Tavg - t_amb)
-                if 0.5 <= p <= 6.0:
-                    p_samples.append(p)
+            continue
+        if rate > 0.05:                        # genuinely rising, not holding
+            ua = cfg["UA_KW_PER_C"]
+            p = C * rate + ua * (Tavg - t_amb)
+            if 0.5 <= p <= 6.0:
+                p_samples.append(p)
     ua = statistics.median(ua_samples) if len(ua_samples) >= 3 else cfg["UA_KW_PER_C"]
     p = statistics.median(p_samples) if len(p_samples) >= 3 else cfg["P_HEAT_KW"]
     return ua, p, len(ua_samples), len(p_samples)
@@ -576,6 +669,34 @@ def print_plan(cfg, series, T0, windows):
         print("  heater first turns : %s" % fmt_hm(first_on))
     else:
         print("  heater first turns : (none needed)")
+    # per-day breakdown (energy + cost), so the plan can be checked against
+    # the smart plug's measured daily kWh
+    price = float(cfg.get("PRICE_PER_KWH") or 0.0)
+    days = {}
+    for i, (ts, _) in enumerate(series):
+        d = dt.datetime.fromtimestamp(ts)
+        key = (d.month, d.day)
+        e = days.setdefault(key, {"on": 0, "kwh": 0.0})
+        if us[i]:
+            e["on"] += 1
+            # same rule as simulate(): an ON hour whose water is already at
+            # the 40 C clamp only offsets loss; otherwise the element runs.
+            if temps[i] >= 40.0 - EPS:
+                ua = make_ua(cfg)
+                t_amb = series[i][1]
+                e["kwh"] += max(0.0, ua * (40.0 - t_amb)) * (cfg["STEP_H"])
+            else:
+                e["kwh"] += cfg["P_HEAT_KW"] * cfg["STEP_H"]
+    if days:
+        print("  per-day (plan):  %8s %5s  %s" %
+              ("day", "heat", "kWh \u00b7 \u00a3" if price else "kWh"))
+        for key in sorted(days):
+            e = days[key]
+            dd = dt.datetime(dt.datetime.now().year, key[0], key[1])
+            line = "  %-17s %4dh  %5.1f" % (dd.strftime("%a %d"), e["on"], e["kwh"])
+            if price:
+                line += " \u00b7 \u00a3%.2f" % (e["kwh"] * price)
+            print(line)
     # safety check
     for i, (ts, _) in enumerate(series):
         if in_window(ts, windows) and temps[i + 1] < cfg["TARGET_TEMP"] - 0.5:
@@ -670,7 +791,8 @@ def phase_series(series, us, windows):
     return phases
 
 
-def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True, weather=None):
+def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True, weather=None,
+                   cmd_state=None, settle_s=None):
     """Run one scheduler step: fetch weather -> replan -> (optionally) apply.
 
     Returns a dict: {phase, setting, water_temp, ambient_now, plan_ts, plan_us,
@@ -680,6 +802,14 @@ def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True, weather=N
     ``weather`` may be a pre-fetched forecast dict (from fetch_forecast) so a
     caller that re-evaluates frequently against fresh state (the web server)
     can avoid re-hitting the weather API every time.
+
+    ``cmd_state`` (dict, mutated in place) throttles the commands actually
+    sent to the spa: the plan is re-fitted every poll, so without a settle the
+    optimal-start boundary can thrash (target 40/28, heater clicking) while
+    the 1 C water reading sits near the "can it coast a bit more?" line.
+    With ``settle_s`` > 0 a datapoint can change at most once in that window
+    (default from cfg SCHED_SETTLE_S). Re-asserting the last-sent value is
+    always allowed so an unconfirmed command can still be retried.
     """
     import spa  # reuses auth/command machinery
     horizon_days = max(3, (int(cfg["HORIZON_H"]) + 23) // 24)
@@ -727,12 +857,42 @@ def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True, weather=N
             # pretending the setpoint moved.
             pass
         else:
+            # Anti-thrash settle: at most one state-changing command per
+            # datapoint per settle window (default 30 min), so the relay/set
+            # can't be hammered by the plan boundary flipping every poll.
+            settle = float(settle_s if settle_s is not None
+                           else cfg.get("SCHED_SETTLE_S") or 0.0)
+            cmd_state = {} if cmd_state is None else cmd_state
+            _now = time.time()
+
+            def _allow(dp, value, urgent=False):
+                # urgent (safety) commands always go through; everything else
+                # is limited to one flip per datapoint per settle window.
+                if urgent or settle <= 0:
+                    return True
+                last = cmd_state.get(dp)
+                if last is None:
+                    return True
+                last_ts, last_val = last
+                if _now - last_ts >= settle:
+                    return True
+                return value == last_val          # re-assert retries, no flip
+
+            def _commit(dp, value):
+                cmd_state[dp] = (_now, value)
+
+            # power and freeze-protection heat are safety commands: never
+            # deferred by the settle window
             if int(state.get("power_state") or 0) != 1:
-                spa.send_command(tokens, "power_state", 1)
-                changed = True
+                if _allow("power_state", 1, urgent=True):
+                    spa.send_command(tokens, "power_state", 1)
+                    _commit("power_state", 1)
+                    changed = True
             if int(state.get("temperature_setting") or 0) != setting:
-                spa.send_command(tokens, "temperature_setting", setting)
-                changed = True
+                if _allow("temperature_setting", setting):
+                    spa.send_command(tokens, "temperature_setting", setting)
+                    _commit("temperature_setting", setting)
+                    changed = True
             # Heat command: keep heat on during window/preheat, and in ECO force
             # the heater off (only when water is clearly above the ECO setpoint,
             # never at/below FLOOR_TEMP) so the tub genuinely coasts down and the
@@ -743,11 +903,17 @@ def scheduler_step(cfg, lat, lon, state=None, tokens=None, apply=True, weather=N
                 cur_on = cur_heat != 0
                 want_on = heat_cmd != 0
                 if cur_on != want_on:
-                    spa.send_command(tokens, "heater_state", 1 if want_on else 0)
-                    changed = True
+                    _urgent = (want_on and isinstance(T0, (int, float))
+                               and float(T0) <= float(cfg["FLOOR_TEMP"]))
+                    if _allow("heater_state", 1 if want_on else 0, urgent=_urgent):
+                        spa.send_command(tokens, "heater_state", 1 if want_on else 0)
+                        _commit("heater_state", 1 if want_on else 0)
+                        changed = True
             if int(state.get("filter_state") or 0) == 0:
-                spa.send_command(tokens, "filter_state", 1)
-                changed = True
+                if _allow("filter_state", 1):
+                    spa.send_command(tokens, "filter_state", 1)
+                    _commit("filter_state", 1)
+                    changed = True
             applied = True
     return {
         "phase": phase,
@@ -784,10 +950,12 @@ def run_controller(cfg, lat, lon, dry_run=False):
     tokens = None if dry_run else __import__("spa").get_tokens()
     log_path = os.path.join(BASE_DIR, cfg["LOG_FILE"])
     last_setting = None
+    cmd_state = {}      # anti-thrash: last command time/value per datapoint
     while True:
         t0 = time.time()
         try:
-            res = scheduler_step(cfg, lat, lon, tokens=tokens, apply=not dry_run)
+            res = scheduler_step(cfg, lat, lon, tokens=tokens, apply=not dry_run,
+                                 cmd_state=cmd_state)
             action = ""
             if res["changed"]:
                 action = ("  [would set temp_setting=%d]" if dry_run

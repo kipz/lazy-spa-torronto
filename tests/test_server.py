@@ -2,6 +2,7 @@
 
 The spa cloud and weather APIs are mocked; no network and no real device.
 """
+import datetime as dt
 import json
 import os
 import sys
@@ -238,6 +239,56 @@ class TestSpaServer(unittest.TestCase):
         send.assert_called_once()
         self.assertIn("Tub lights", send.call_args[0][0])
 
+    def test_plug_read_failure_quiet_suppresses_duplicate_log(self):
+        # When the spa poll dies on the same network error, poll_plug(quiet)
+        # still flags the plugs offline but must not add a second "Plug read
+        # failed" line to the operation feed.
+        app = self.app
+        app._plugs = {"mains": {"device": "Tub mains", "online": True, "ts": 1}}
+        with mock.patch.object(server.plug, "read_all", return_value=None):
+            app.poll_plug(quiet=True)
+        msgs = [e["msg"] for e in app.get_log(20)]
+        self.assertFalse(any("Plug read failed" in m for m in msgs), msgs)
+        self.assertFalse(app._plugs["mains"]["online"])   # still flagged
+        # a standalone failure (no spa error) should still be logged (the
+        # quiet call incremented the throttle counter, so reset it)
+        app._plug_err = 0
+        with mock.patch.object(server.plug, "read_all", return_value=None):
+            app.poll_plug(quiet=False)
+        msgs = [e["msg"] for e in app.get_log(20)]
+        self.assertTrue(any("Plug read failed" in m for m in msgs), msgs)
+
+    def test_measured_cost_per_day_figures(self):
+        # "how much did it cost" needs a real calendar day + an average over
+        # the recent full days of metering — both from the smart plug's real
+        # wattage, and both excluding the partial current day.
+        app = self.app
+        app.cfg.scheduler_cfg["PRICE_PER_KWH"] = 0.25
+        now = 1_800_000_000                      # 2017-01-19 ~04:00 UTC
+        start = now - 3 * 86400
+        hist = []
+        ts = int(start)
+        while ts < now:
+            hour = dt.datetime.fromtimestamp(ts).hour
+            watts = 1800.0 if 18 <= hour < 21 else 12.0   # heater 18:00-21:00
+            hist.append({"ts": ts, "watts": watts, "on": True, "fault": 0})
+            ts += 900                              # 4 samples/hour
+        with app._lock:
+            app._plug_hist = hist
+        with mock.patch.object(server.time, "time", return_value=now):
+            mc = app._measured_cost_payload()
+        self.assertTrue(mc["enough"])
+        self.assertIsNotNone(mc["kwh_yesterday"])
+        # 3-day span: the newest full day, the one before it, and the oldest
+        # day only has 16 h of coverage (samples start mid-day) so is excluded
+        self.assertEqual(mc["days_measured"], 2)
+        # each full day carries ~3 h of 1800 W
+        self.assertAlmostEqual(mc["kwh_yesterday"], 3 * 1.8, delta=0.3)
+        self.assertAlmostEqual(mc["cost_yesterday"],
+                               0.25 * mc["kwh_yesterday"], delta=0.1)
+        self.assertAlmostEqual(mc["kwh_avg_day"], mc["kwh_yesterday"], delta=0.3)
+        self.assertIsNotNone(mc["cost_avg_day"])
+
     def test_plug_relay_alerts_off_by_default_and_debounced(self):
         # The user reported plug relay alerts as spam: PLUG_NOTIFY defaults to
         # off, so a real toggle must never notify without an explicit enable.
@@ -332,9 +383,13 @@ class TestSpaServer(unittest.TestCase):
             self.assertEqual(len([l for l in f if l.strip()]), 1)
 
     def test_measures_cooling_rate_from_coast_downs(self):
+        # Sampling pairs readings SEVERAL hours apart (UA_SAMPLE_MIN_S): with
+        # the spa's 1 C resolution a 1 h window cannot separate a
+        # well-insulated "hold" from real cooling (that overfit was the
+        # "preheat at noon" bug), so 3 h spans are the unit being tested.
         base = 1_800_000_000            # aligned to the hour
-        self.app._amb = {base + h * 3600: 5.0 for h in range(8)}
-        self.app.cfg.scheduler_cfg["UA_KW_PER_C"] = 0.02
+        self.app._amb = {base + h * 3600: 5.0 for h in range(16)}
+        self.app.cfg.scheduler_cfg["UA_KW_PER_C"] = 0.06
         clock = {"now": base}
         states = [(38.6, 28), (37.2, 28), (35.8, 28)]
         with mock.patch.object(server.time, "time", lambda: clock["now"]):
@@ -342,13 +397,14 @@ class TestSpaServer(unittest.TestCase):
                 "water_temperature": 40, "temperature_setting": 28,
                 "power_state": 1, "heater_state": 0})       # anchor at +0h
             for i, (water, setpoint) in enumerate(states, start=1):
-                clock["now"] = base + i * 7200
+                clock["now"] = base + i * 10800
                 self.app._maybe_sample_ua({
                     "water_temperature": water, "temperature_setting": setpoint,
                     "power_state": 1, "heater_state": 0})
         self.assertEqual(len(self.app._ua_samples), 3)
+        # exact Newton-cooling fit over 3 h spans: median ~0.0203 kW/C
         self.assertAlmostEqual(self.app.cfg.scheduler_cfg["UA_KW_PER_C"],
-                               0.0308, delta=0.002)
+                               0.0203, delta=0.002)
         path = os.path.join(self.tmp.name, "scheduler_model.json")
         with open(path) as f:
             model = json.load(f)
@@ -356,7 +412,7 @@ class TestSpaServer(unittest.TestCase):
         # model last updated on the 2nd sample (UA_MIN_SAMPLES=2); the third
         # is within tolerance so no re-save happened -> record says 2 samples
         self.assertEqual(model["ua_samples"], 2)
-        self.assertAlmostEqual(model["UA_KW_PER_C"], 0.0308, delta=0.002)
+        self.assertAlmostEqual(model["UA_KW_PER_C"], 0.0203, delta=0.002)
 
     def test_register_telemetry_logs_probe_offsets(self):
         app = self.app
@@ -383,7 +439,8 @@ class TestSpaServer(unittest.TestCase):
     def test_ua_learns_held_temp_as_upper_bound(self):
         # A well-insulated tub can hold the same integer degree for hours.
         # That "no drop" is still evidence of low heat loss: it must produce
-        # an upper-bound sample (0.5 C assumed drop), not be dismissed.
+        # an upper-bound sample (0.5 C assumed drop over the span), not be
+        # dismissed. The fit uses the exact Newton-cooling log form.
         base = 1_800_000_000            # aligned to the hour
         self.app._amb = {base + h * 3600: 5.0 for h in range(4)}
         self.app.cfg.scheduler_cfg["UA_KW_PER_C"] = 0.03
@@ -392,13 +449,14 @@ class TestSpaServer(unittest.TestCase):
             self.app._maybe_sample_ua({
                 "water_temperature": 40, "temperature_setting": 28,
                 "power_state": 1, "heater_state": 0})       # anchor at +0h
-            clock["now"] = base + 3600
+            clock["now"] = base + 10800
             self.app._maybe_sample_ua({
                 "water_temperature": 40, "temperature_setting": 28,
                 "power_state": 1, "heater_state": 0})       # held at 40
         self.assertEqual(len(self.app._ua_samples), 1)
         C = self.app.cfg.scheduler_cfg["C_KWH_PER_C"]
-        expected = C * 0.5 / 1.0 / 35.0   # dT_res/1h / (T-amb)
+        import math
+        expected = C / 3.0 * math.log(35.0 / 34.5)  # 0.5 C drop over 3 h
         self.assertAlmostEqual(self.app._ua_samples[-1], expected, delta=0.0005)
 
     def test_history_seeded_from_shadow_log(self):
@@ -460,11 +518,11 @@ class TestSpaServer(unittest.TestCase):
             self.app._maybe_sample_ua({
                 "water_temperature": 38.0, "temperature_setting": 28,
                 "power_state": 1, "heater_state": 0})    # anchor at +0h
-            clock["now"] = base + 7200
+            clock["now"] = base + 10800
             self.app._amb = {}                           # cache gone after replan
             self.app._maybe_sample_ua({
                 "water_temperature": 36.6, "temperature_setting": 28,
-                "power_state": 1, "heater_state": 0})    # cooled ~1.4C in 2h
+                "power_state": 1, "heater_state": 0})    # cooled ~1.4C in 3h
         self.assertEqual(len(self.app._ua_samples), 1)
 
     def test_notify_target_reached_shoots_once_per_hour(self):
@@ -483,6 +541,50 @@ class TestSpaServer(unittest.TestCase):
         self.assertEqual(send.call_count, 1)
         msgs = [e["msg"] for e in self.app.get_log(50)]
         self.assertTrue(any("Telegram target-reached sent" in m for m in msgs), msgs)
+
+    def test_tg_send_queues_failed_message_for_retry(self):
+        app = self.app
+        # success: not queued
+        with mock.patch.object(server.notify, "send_text",
+                               return_value=(True, "")) as send:
+            ok, err = app._tg_send("hello")
+        self.assertTrue(ok)
+        send.assert_called_once_with("hello")
+        self.assertEqual(app._pending_tg, [])
+        # transient failure: queued, deduped, bounded
+        with mock.patch.object(server.notify, "send_text",
+                               return_value=(False, "read timed out")):
+            ok, err = app._tg_send("alert-1")
+            ok2, err2 = app._tg_send("alert-1")        # identical -> deduped
+            ok3, err3 = app._tg_send("alert-2")
+        self.assertFalse(ok)
+        self.assertFalse(ok2)
+        self.assertEqual(len(app._pending_tg), 2)      # alert-1 counted once
+        self.assertEqual([m["text"] for m in app._pending_tg],
+                         ["alert-1", "alert-2"])
+
+    def test_tg_flush_retries_then_drops_stale(self):
+        app = self.app
+        app._pending_tg = [
+            {"text": "fresh", "ts": 100},
+            {"text": "stale", "ts": 100},
+        ]
+        # stale is dropped (older than the 1 h TTL), fresh is retried
+        clock = {"now": 100 + app._pending_tg_ttl + 10}
+        with mock.patch.object(server.time, "time", lambda: clock["now"]), \
+             mock.patch.object(server.notify, "send_text",
+                               side_effect=[(True, "")]) as send:
+            app._pending_tg[0]["ts"] = clock["now"] - 10   # fresh
+            app._pending_tg[1]["ts"] = clock["now"] - 4000  # stale
+            app._flush_pending_tg()
+        send.assert_called_once_with("fresh")
+        self.assertEqual(app._pending_tg, [])
+        # if the retry also fails the message stays queued
+        with mock.patch.object(server.notify, "send_text",
+                               return_value=(False, "nope")):
+            app._pending_tg = [{"text": "x", "ts": 200}]
+            app._flush_pending_tg(now=210)
+        self.assertEqual([m["text"] for m in app._pending_tg], ["x"])
 
     def test_notify_skipped_in_eco(self):
         clock = {"now": 100.0}

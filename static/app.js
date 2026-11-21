@@ -982,6 +982,21 @@ function renderCost(price) {
   kb.textContent = today
     ? state.plugKwhToday.toFixed(2) + " kWh" + (p ? " · £" + (price * state.plugKwhToday).toFixed(2) : "")
     : "—";
+  // Per-day measured cost: a full calendar day + the average over all recent
+  // full days the plug has covered (restart/outage days are excluded).
+  const elY = $("#cfgYesterday");
+  const elA = $("#cfgAvgDay");
+  if (elY) {
+    elY.textContent = mc.kwh_yesterday != null && p && enough
+      ? mc.kwh_yesterday.toFixed(2) + " kWh · £" + mc.cost_yesterday.toFixed(2)
+      : (mc.kwh_yesterday != null ? mc.kwh_yesterday.toFixed(2) + " kWh" : "—");
+  }
+  if (elA) {
+    elA.textContent = mc.kwh_avg_day != null && p && enough
+      ? "£" + mc.cost_avg_day.toFixed(2) + " · " + mc.kwh_avg_day.toFixed(2) + " kWh"
+        + (mc.days_measured ? " (" + mc.days_measured + "d)" : "")
+      : "—";
+  }
   if (sb) {
     if (d7) {
       let txt = state.plugKwh7d.toFixed(1) + " kWh" + (p ? " · £" + (price * state.plugKwh7d).toFixed(2) : "");

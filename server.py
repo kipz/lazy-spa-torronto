@@ -68,15 +68,19 @@ REL_LOGIN_BACKOFF_S = 3600
 # number (projected cost / saving) is trusted. With less data the window is
 # dominated by a restart/outage and would mislead.
 MEASURED_MIN_HOURS = 24
-# Online cooling-rate (UA) estimate from real heater-off coast-downs. A 1 h
-# span is enough to rise above the spa's 1 C temperature resolution, and a
-# "held steady" span (no measurable drop) is still used as an upper-bound
-# sample so a very well-insulated tub is learned, not ignored.
+# Online cooling-rate (UA) estimate from real heater-off coast-downs. The
+# spa's probe reports whole degrees C, so a 1 h window cannot tell a really
+# well-insulated tub (UA ~0.005 kWh/C — measured ~0.15 C/h) apart from a
+# "hold": it used to be fitted as 0.5 C/h, over-estimating heat loss ~4x and
+# driving the plan into a long midday preheat. Pair readings SEVERAL hours
+# apart so real cooling is resolvable, and fit a "held steady" span (no
+# measurable drop) as an upper bound of 0.5 C over the whole span — the
+# fitted value then sits just above reality, not four times above it.
 UA_MIN_SAMPLES = 2                  # samples needed before the model is updated
-UA_SAMPLE_MIN_S = 3600               # 1 h between the two observation points
-UA_SAMPLE_MAX_S = 4 * 3600         # discard longer gaps (weather changed too much)
+UA_SAMPLE_MIN_S = 3 * 3600           # several hours between observation points
+UA_SAMPLE_MAX_S = 8 * 3600         # discard longer gaps (weather changed too much)
 UA_SAMPLE_MAX_N = 50               # rolling median window
-UA_BOUNDS = (0.005, 0.3)           # kW/degC, sane physical range
+UA_BOUNDS = (0.001, 0.3)           # kW/degC, sane physical range
 UA_AMBIENT_MIN_DIFF = 3.0          # need a clear water/ambient difference
 UA_SETPOINT_MARGIN = 1.0           # only fit well above setpoint (thermostat idle)
 # Ongoing register telemetry (probe-offset investigation). The full raw
@@ -301,6 +305,7 @@ class SpaServer:
         self._plan_ts = 0.0
         self._tokens = None
         self._stopping = False
+        self._cmd_state = {}        # scheduler cmd settle: dp -> (ts, value)
         self._tub_online_prev = None     # last observed tub online state
         self._poll_err = 0               # consecutive poll failures (log throttle)
         self._notified_auth = False      # one-shot Telegram "tokens expired" alert
@@ -309,6 +314,11 @@ class SpaServer:
         self._forecast_ts = 0.0         # when the forecast cache was filled
         self._log = []              # recent operations, newest last
         self._log_lock = threading.Lock()
+        self._pending_tg = []       # Telegram sends that failed (transient
+                                    # network) and are queued for retry
+        self._pending_tg_max = 20
+        self._pending_tg_ttl = 3600  # drop a queued message after an hour
+        self._pending_tg_lock = threading.Lock()
         # smart plug (Tuya cloud) state
         self._plugs = {}             # device_id -> latest normalised reading
         # Relay-toggle alert state: a change must be seen on two consecutive
@@ -399,6 +409,36 @@ class SpaServer:
             return True
         return not self.tub_online()
 
+    # -- Telegram outbox (retry so a network wobble can't eat a message) ----
+    def _tg_send(self, text):
+        """Send a Telegram message; on a transient failure queue it for retry
+        instead of dropping it. Returns (ok, err). Bounded + deduped."""
+        ok, err = notify.send_text(text)
+        if ok:
+            return True, ""
+        with self._pending_tg_lock:
+            if all(m["text"] != text for m in self._pending_tg):
+                self._pending_tg.append({"text": text, "ts": int(time.time())})
+                if len(self._pending_tg) > self._pending_tg_max:
+                    del self._pending_tg[:-self._pending_tg_max]
+        return False, err
+
+    def _flush_pending_tg(self, now=None):
+        """Retry queued messages that failed on a transient network blip.
+        Drops anything older than the TTL (a stale event is worse than none)."""
+        now = now or time.time()
+        if not self._pending_tg:
+            return
+        kept = []
+        for m in self._pending_tg:
+            if now - m["ts"] > self._pending_tg_ttl:
+                continue
+            ok, _ = notify.send_text(m["text"])
+            if not ok:
+                kept.append(m)
+        with self._pending_tg_lock:
+            self._pending_tg[:] = kept
+
     def _track_tub_online(self, state):
         """Detect online<->offline transitions: log them and (once only per
         transition) ping Telegram so the user is told the tub fell off the
@@ -419,10 +459,10 @@ class SpaServer:
                    "the cloud last heard from it a few minutes ago. Commands and "
                    "auto-heating are paused until it reconnects.")
         if notify.configured():
-            ok, err = notify.send_text(msg)
+            ok, err = self._tg_send(msg)
             self.add_log("ok" if ok else "warn",
                          "Telegram offline-alert %s (%s)"
-                         % ("sent" if ok else "failed: " + err,
+                         % ("sent" if ok else "queued: " + err,
                             "online" if online else "offline"))
         self._broadcast("log")
 
@@ -556,10 +596,10 @@ class SpaServer:
         label = "ON" if on else "OFF"
         msg = ("<b>Torronto</b> \U0001F50C · <b>%s</b> plug is now <b>%s</b>"
                % (name, label))
-        ok, err = notify.send_text(msg)
+        ok, err = self._tg_send(msg)
         self.add_log("ok" if ok else "warn",
                      "Plug %s → %s (%s)"
-                     % (name, label, "sent" if ok else "failed: " + err))
+                     % (name, label, "sent" if ok else "queued: " + err))
         self._plug_last_notify[dev_id] = now
         self._plug_pending[dev_id] = {"on": on, "confirmed": 1}
 
@@ -604,8 +644,35 @@ class SpaServer:
                 kwh += (pts[i - 1].get("watts") or 0.0) / 1000.0 * dt_h
         return kwh
 
-    def poll_plug(self):
-        """Fetch all configured plugs once over the Tuya cloud. Never raises."""
+    def plug_kwh_by_day(self, days=7):
+        """Measured kWh bucketed by calendar day: {day: (kwh, hours_covered)}.
+
+        Built from the same real plug samples as plug_kwh_window. ``hours``
+        is how much of the day is actually covered by meter samples, so a day
+        dominated by a restart/outage can be excluded from averages.
+        """
+        cutoff = int(time.time()) - int(days * 86400)
+        with self._lock:
+            pts = [h for h in self._plug_hist if h["ts"] >= cutoff]
+        out = {}
+        for i in range(1, len(pts)):
+            a, b = pts[i - 1], pts[i]
+            dt_h = (b["ts"] - a["ts"]) / 3600.0
+            if 0 < dt_h <= 2.0:
+                day = dt.datetime.fromtimestamp(a["ts"]).strftime("%Y-%m-%d")
+                kwh, cov = out.get(day, (0.0, 0.0))
+                out[day] = (kwh + (a.get("watts") or 0.0) / 1000.0 * dt_h,
+                            cov + dt_h)
+        return out
+
+    def poll_plug(self, quiet=False):
+        """Fetch all configured plugs once over the Tuya cloud. Never raises.
+
+        ``quiet`` suppresses the failure log line: the caller sets it when the
+        spa poll failed on the same tick with a network error, in which case
+        the outage is already on the feed — logging "Plug read failed" too
+        just doubles the noise for the same dead connection.
+        """
         readings, err = None, ""
         try:
             readings = plug.read_all(self.cfg.plug_device_id)
@@ -621,7 +688,7 @@ class SpaServer:
             for k in self._plugs:
                 self._plugs[k] = dict(self._plugs[k], online=False)
         self._plug_err += 1
-        if self._plug_err % 6 == 1:  # log ~ every 6th failure (~3 min apart)
+        if (self._plug_err % 6 == 1) and not quiet:  # log ~ every 6th failure
             self.add_log("warn", "Plug read failed%s"
                          % (": " + err if err else ""))
 
@@ -765,16 +832,19 @@ class SpaServer:
     def _maybe_sample_ua(self, state):
         """Estimate the heat-loss coefficient (UA) from real coast-downs.
 
-        Pairs shadow readings ~1 h apart while the tub is well above its
-        setpoint (so the thermostat cannot be heating), and keeps a rolling
-        median. A measured drop fits UA directly; a *held* temperature (no
-        measurable drop at the 1 C display resolution) is still strong evidence
-        of low heat loss, so it is fitted as an upper-bound sample using half
-        a degree (the most cooling we cannot rule out). Using an upper bound
-        keeps the plan safe (never schedules less heat than reality could
-        demand) while still learning great insulation. Once enough samples
-        exist the fitted value is saved to scheduler_model.json and used by the
-        next replan.
+        Pairs shadow readings several hours apart (UA_SAMPLE_MIN_S) while the
+        tub is well above its setpoint (so the thermostat cannot be heating),
+        and keeps a rolling median. The spa's 1 C sensor resolution demands a
+        long span, otherwise a well-insulated tub reads as a perpetual "hold"
+        and would be fitted as ~0.5 C/h — over-estimating loss ~4x (that was
+        the plan's "preheat at noon" bug). A measured drop fits UA directly;
+        a *held* span (no measurable drop) is still strong evidence of low
+        heat loss, so it is fitted as an upper-bound sample using half a
+        degree over the whole span (the most cooling we cannot rule out).
+        Using an upper bound keeps the plan safe (never schedules less heat
+        than reality could demand) while still learning great insulation.
+        Once enough samples exist the fitted value is saved to
+        scheduler_model.json and used by the next replan.
         """
         now = int(time.time())
         if not spa.is_online(state):
@@ -817,7 +887,7 @@ class SpaServer:
         hold = dT > -0.5   # no clear cooling at 1 C sensor resolution
         if hold:
             # Upper bound: assume the most cooling we cannot rule out (0.5 C).
-            dT = -0.5
+            t2 = t1 - 0.5
         t_amb = prev["ambient"]
         if not isinstance(t_amb, (int, float)):
             return
@@ -827,9 +897,11 @@ class SpaServer:
         if abs(t_avg - t_amb) <= UA_AMBIENT_MIN_DIFF:
             return
         dt_h = dt_s / 3600.0
-        ua = (self.cfg.scheduler_cfg["C_KWH_PER_C"] * (-dT / dt_h)
-              / (t_avg - t_amb))
-        if not (UA_BOUNDS[0] <= ua <= UA_BOUNDS[1]):
+        # Exact Newton-cooling fit (not the linear secant): it stays accurate
+        # over the long spans needed to resolve the 1 C sensor resolution.
+        ua = scheduler.ua_from_pair(
+            self.cfg.scheduler_cfg["C_KWH_PER_C"], t1, t2, t_amb, dt_h)
+        if ua is None or not (UA_BOUNDS[0] <= ua <= UA_BOUNDS[1]):
             return
         self._ua_samples.append(ua)
         if len(self._ua_samples) > UA_SAMPLE_MAX_N:
@@ -925,10 +997,10 @@ class SpaServer:
         self._notify_at = now
         msg = ("<b>Torronto</b> · the tub has reached <b>%g°C</b> (target %g°C, %s)."
                % (water, target, phase))
-        ok, err = notify.send_text(msg)
+        ok, err = self._tg_send(msg)
         self.add_log("ok" if ok else "warn",
                      "Telegram target-reached %s (%s)"
-                     % ("sent" if ok else "failed: " + err, phase))
+                     % ("sent" if ok else "queued: " + err, phase))
         self._broadcast("log")
 
     def _tg_command(self, command):
@@ -1021,6 +1093,14 @@ class SpaServer:
                          % (m24, price * m24))
             lines.append("measured (plug) 7d : %.2f kWh \u00B7 \u00A3%.2f"
                          % (m7, price * m7))
+            mc = self._measured_cost_payload()
+            if mc.get("kwh_yesterday") is not None:
+                lines.append("yesterday: %.2f kWh \u00B7 \u00A3%.2f"
+                             % (mc["kwh_yesterday"], mc["cost_yesterday"]))
+            if mc.get("kwh_avg_day") is not None and mc.get("days_measured"):
+                lines.append("avg/day (%dd): %.2f kWh \u00B7 \u00A3%.2f"
+                             % (mc["days_measured"], mc["kwh_avg_day"],
+                                mc["cost_avg_day"]))
         if not self._plan:
             lines.append("no heating plan yet \u2014 run /plan or wait for the next replan")
             return "\n".join(lines)
@@ -1052,6 +1132,8 @@ class SpaServer:
         chat = notify.configured_chat_id()
         offset = 0
         while not self._stopping:
+            # retry outbox sends that failed on an earlier network blip
+            self._flush_pending_tg()
             try:
                 updates = notify.get_updates(offset)
             except Exception:
@@ -1188,7 +1270,8 @@ class SpaServer:
             self._forecast_ts = time.time()
         res = scheduler.scheduler_step(
             cfg, self._lat, self._lon, state=self.get_state()[0],
-            tokens=self._get_tokens(), apply=apply, weather=self._forecast_weather)
+            tokens=self._get_tokens(), apply=apply, weather=self._forecast_weather,
+            cmd_state=self._cmd_state)
         self._plan = res
         self._plan_ts = time.time()
         # Keep forecast ambient for hours that have just left the plan window,
@@ -1372,7 +1455,9 @@ class SpaServer:
 
         Gated on MEASURED_MIN_HOURS of real plug history: with less data the
         rolling 7-day window (and any "saving") is dominated by a restart or
-        outage and would show a misleading £0/100%.
+        outage and would show a misleading £0/100%. Includes per-day figures
+        (yesterday and the average full day), which are what a "how much did
+        it cost" question really wants.
         """
         cfg = self.cfg.scheduler_cfg
         price = float(cfg.get("PRICE_PER_KWH") or 0.0)
@@ -1386,6 +1471,27 @@ class SpaServer:
         out = {"enough": enough, "coverage_h": round(span_h, 1),
                "measured_kwh_7d": round(m7, 3),
                "monthly_cost": round(price * m7 * 30.0 / 7.0, 2)}
+        # Per-day figures: strict calendar days with near-full coverage only,
+        # so a restart or power-cut day isn't averaged in as a cheap day.
+        today = dt.datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d")
+        full = {d: kwh for d, (kwh, cov) in self.plug_kwh_by_day(7).items()
+                if d != today and cov >= 20.0}
+        out["days_measured"] = len(full)
+        if full:
+            last_day = max(full)
+            kwh_y = full[last_day]
+            kwh_avg = sum(full.values()) / len(full)
+            out["last_day"] = last_day
+            out["kwh_yesterday"] = round(kwh_y, 2)
+            out["cost_yesterday"] = round(price * kwh_y, 2)
+            out["kwh_avg_day"] = round(kwh_avg, 2)
+            out["cost_avg_day"] = round(price * kwh_avg, 2)
+        else:
+            out["last_day"] = None
+            out["kwh_yesterday"] = None
+            out["cost_yesterday"] = None
+            out["kwh_avg_day"] = None
+            out["cost_avg_day"] = None
         plan = self._plan or {}
         alwayson = plan.get("energy_alwayson_kwh")
         days = len(plan.get("plan_ts") or []) / 24.0
@@ -1687,6 +1793,7 @@ def _poller_loop(app, stop_event):
     """
     while not stop_event.is_set():
         now = time.time()
+        spa_failed = False
         try:
             state = spa.shadow(app._get_tokens())
             app._poll_err = 0
@@ -1712,6 +1819,7 @@ def _poller_loop(app, stop_event):
                         "<b>Torronto</b> \u26a0 api token expired or revoked "
                         "\u2014 attempting an automatic re-login.")
                 app._auto_relogin()
+            spa_failed = True
             if app._poll_err % POLL_ERR_LOG_EVERY == 1:
                 msg = str(e)
                 if spa.is_auth_error(e):
@@ -1735,7 +1843,9 @@ def _poller_loop(app, stop_event):
         if app.plug_enabled() and now >= app._plug_next:
             app._plug_next = now + app.cfg.plug_poll
             try:
-                app.poll_plug()
+                # When the spa poll just died on the same network error, don't
+                # add a duplicate "Plug read failed" line to the feed.
+                app.poll_plug(quiet=spa_failed)
             except Exception:  # noqa: BLE001 - never let the plug stop the loop
                 pass
         stop_event.wait(POLL_SECONDS)
